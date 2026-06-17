@@ -1,0 +1,31 @@
+# Default KCQRL-RL configuration. All external assets live outside this repo.
+seed: 42
+device: auto
+
+assets:
+  # In Colab, mount Drive at /content/drive before running scripts.
+  base_dir: /content/drive/MyDrive/Colab_Projects/KCQRL-main/data/XES3G5M
+  q_matrix: metadata/q_matrix_multihot_36_expert.pt
+  item_bank: metadata/item_bank_128d.npy
+  item_features: metadata/item_features_768d.npy
+  ncdm_checkpoint: metadata/ncdm_model_36d_expert_best.pt
+  mirt_checkpoint: metadata/mirt_model_36d.pt
+  train_sequences: kc_level/train_valid_sequences.csv
+  test_sequences: kc_level/test.csv
+
+evaluation:
+  horizon: 20
+  max_students: 50
+  candidate_size: 50
+  policies:
+    - Random
+    - MIRT-MFI
+    - MIRT-KLI
+    - DDPG
+    - OneStepOracle
+
+training:
+  episodes: 10
+  batch_size: 32
+  learning_rate: 0.0001
+  output_dir: outputs
