@@ -1,27 +1,23 @@
+"""DDPG agent assembly helpers."""
+from __future__ import annotations
 import torch
-import torch.nn as nn
-
-class LSTMActor(nn.Module):
-    def __init__(self, state_dim, hidden=128):
-        super().__init__()
-        self.lstm = nn.LSTM(state_dim, hidden, batch_first=True)
-        self.fc = nn.Linear(hidden, state_dim)
-
-    def forward(self, state_seq):
-        out, _ = self.lstm(state_seq)
-        out = out[:, -1, :]
-        return self.fc(out)
+from models.actor import LSTMActor
+from models.critic import LSTMCritic
 
 
-class Critic(nn.Module):
-    def __init__(self, state_dim, action_dim):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(state_dim + action_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
-        )
+def soft_update(source: torch.nn.Module, target: torch.nn.Module, tau: float) -> None:
+    for p, tp in zip(source.parameters(), target.parameters()):
+        tp.data.copy_(tau * p.data + (1.0 - tau) * tp.data)
 
-    def forward(self, s, a):
-        x = torch.cat([s, a], dim=-1)
-        return self.fc(x)
+
+class DDPGAgent:
+    def __init__(self, q_dim=36, semantic_dim=128, hidden_dim=128, actor_lr=1e-4, critic_lr=1e-4, device="cpu"):
+        self.device = torch.device(device)
+        self.actor = LSTMActor(semantic_dim, q_dim, hidden_dim=hidden_dim).to(self.device)
+        self.critic = LSTMCritic(hidden_dim, self.actor.action_dim).to(self.device)
+        self.target_actor = LSTMActor(semantic_dim, q_dim, hidden_dim=hidden_dim).to(self.device)
+        self.target_critic = LSTMCritic(hidden_dim, self.actor.action_dim).to(self.device)
+        self.target_actor.load_state_dict(self.actor.state_dict())
+        self.target_critic.load_state_dict(self.critic.state_dict())
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
