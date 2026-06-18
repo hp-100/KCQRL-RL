@@ -1,168 +1,110 @@
+"""Real DDPG training pipeline for KCQRL-RL."""
+from __future__ import annotations
+from pathlib import Path
+import random
+import numpy as np
+import pandas as pd
 import torch
+import torch.nn as nn
 from tqdm import tqdm
-import torch.nn.functional as F
-import wandb
-import os
 
-class Trainer:
-    def __init__(self, model, train_dataloader, optimizer, evaluator, device, args):
-        self.model = model
-        self.train_dataloader = train_dataloader
-        self.optimizer = optimizer
-        self.evaluator = evaluator
-        self.alpha = args.alpha
-        self.num_epochs = args.num_epochs
-        self.patience = args.patience
-        self.model_save_dir = args.model_save_dir
-        self.T = args.temperature
-        self.device = device
-        # A new argument to disable clustering (DEFAULT IS ENABLING CLUSTERS)
-        self.disable_clusters = args.disable_clusters
+from agents.replay_buffer import ReplayBuffer
+from core.state_builder import candidate_item_vectors, clean_sequence, find_sequence_columns
+from models.ddpg import DDPGAgent, soft_update
+from models.ncdm import OfficialNCDM, fit_student_alpha, load_q_matrix, predict_remaining, safe_load_ncdm_checkpoint
+from reward.reward_fn import entropy_from_predictions, information_gain_reward
+
+
+class DDPGTrainer:
+    def __init__(self, config: dict, device: torch.device):
+        self.config = config; self.device = device
+        self.seed = int(config.get("seed", 42)); random.seed(self.seed); np.random.seed(self.seed); torch.manual_seed(self.seed)
+        self.paths = self._paths(config.get("assets", {}) or {})
+        tc = config.get("training", {}) or {}
+        self.episodes = int(tc.get("episodes", 5)); self.batch_size = int(tc.get("batch_size", 64))
+        self.gamma = float(tc.get("gamma", 0.99)); self.tau = float(tc.get("tau", 0.005))
+        self.horizon = int(tc.get("horizon", 10)); self.max_students = int(tc.get("max_students", 300))
+        self.output_dir = Path(tc.get("output_dir", "outputs")); self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.buffer = ReplayBuffer(int(tc.get("replay_capacity", 20000)), self.seed)
+
+    @staticmethod
+    def _paths(asset_cfg):
+        base = Path(asset_cfg.get("base_dir", ".")).expanduser()
+        return {k: (Path(v).expanduser() if Path(str(v)).is_absolute() else base / str(v)) for k, v in asset_cfg.items() if k != "base_dir" and v is not None}
+
+    def missing_assets(self):
+        required = ["q_matrix", "item_bank", "ncdm_checkpoint", "train_sequences"]
+        return [self.paths[k] for k in required if k not in self.paths or not self.paths[k].exists()]
+
+    def _load(self):
+        q_matrix = load_q_matrix(self.paths["q_matrix"], self.device)
+        item_bank = torch.tensor(np.load(self.paths["item_bank"]), dtype=torch.float32, device=self.device)
+        item_bank = nn.functional.normalize(item_bank, p=2, dim=1)
+        max_item = min(q_matrix.shape[0], item_bank.shape[0])
+        df = pd.read_csv(self.paths["train_sequences"])
+        q_col, r_col = find_sequence_columns(df)
+        ncdm = OfficialNCDM(max(1, len(df)), q_matrix.shape[0], q_matrix.shape[1]).to(self.device)
+        safe_load_ncdm_checkpoint(ncdm, self.paths["ncdm_checkpoint"], self.device)
+        ncdm.eval()
+        for p in ncdm.parameters(): p.requires_grad = False
+        agent = DDPGAgent(q_dim=q_matrix.shape[1], semantic_dim=item_bank.shape[1], device=self.device)
+        return q_matrix, item_bank, max_item, df.sample(n=min(self.max_students, len(df)), random_state=self.seed), q_col, r_col, ncdm, agent
+
+    def select_candidate(self, ideal, avail_i, q_matrix, ncdm):
+        cand = candidate_item_vectors(avail_i, q_matrix, ncdm)
+        return int(torch.argmin(torch.cdist(ideal, cand).squeeze(0)).item())
+
+    def _entropy(self, ncdm, q_matrix, hist_i, hist_r, targets):
+        if not targets: return 0.0
+        return float(entropy_from_predictions(predict_remaining(ncdm, q_matrix, hist_i, hist_r, targets, device=self.device)).item())
+
+    def optimize(self, agent: DDPGAgent):
+        if len(self.buffer) <= self.batch_size: return None
+        b = self.buffer.sample(self.batch_size, self.device)
+        h0,c0,sem,q,diff,disc,resp,act,rew,nsem,nq,ndiff,ndisc,nresp,done = b
+        rew = rew.unsqueeze(1); done = done.unsqueeze(1)
+        ideal, h1, c1 = agent.actor(sem, q, diff, disc, resp, h0, c0)
+        with torch.no_grad():
+            nideal, nh, _ = agent.target_actor(nsem, nq, ndiff, ndisc, nresp, h1.detach(), c1.detach())
+            target_q = rew + self.gamma * agent.target_critic(nh, nideal) * (1.0 - done)
+        critic_loss = nn.SmoothL1Loss()(agent.critic(h1.detach(), act), target_q)
+        agent.critic_optimizer.zero_grad(); critic_loss.backward(); torch.nn.utils.clip_grad_norm_(agent.critic.parameters(), 1.0); agent.critic_optimizer.step()
+        actor_loss = -agent.critic(h1, ideal).mean()
+        agent.actor_optimizer.zero_grad(); actor_loss.backward(); torch.nn.utils.clip_grad_norm_(agent.actor.parameters(), 1.0); agent.actor_optimizer.step()
+        soft_update(agent.actor, agent.target_actor, self.tau); soft_update(agent.critic, agent.target_critic, self.tau)
+        return float(actor_loss.item()), float(critic_loss.item())
 
     def train(self):
-        best_micro_f1 = 0
-        cur_patience = 0
-        for epoch in range(self.num_epochs):
-            print(f"Epoch {epoch + 1}/{self.num_epochs}")
-            
-            # Iterate one epoch
-            epoch_loss = self.train_epoch()
-            print(f"Total Loss: {epoch_loss:.4f}")
-
-            # Run eval
-            avg_acc, total_acc, avg_f1, micro_f1 = self.evaluator.evaluate(self.model)
-            print(f"Eval Micro F1: {micro_f1:.4f}")
-
-            # Update Wandb scores after epoch
-            wandb.log({'epoch_loss': epoch_loss, 'micro_f1': micro_f1, 'avg_f1': avg_f1})
-            
-            if micro_f1 > best_micro_f1:
-                best_micro_f1 = micro_f1
-                cur_patience = 0
-                print("Saving model")
-                self.save_model()
-
-            else:
-                cur_patience += 1
-
-            if cur_patience >= self.patience:
-                print("Stopping training")
-                break
-
-        print("Training complete.")
-
-    def train_epoch(self):
-        self.model.train()
-        total_loss = 0
-
-        # Initialize tqdm progress bar
-        progress_bar = tqdm(self.train_dataloader, desc='Training', leave=True)
-
-        for i, batch in enumerate(progress_bar):
-            self.optimizer.zero_grad()
-
-            batch = self._batch_to_device(batch)
-
-            loss = self.process_batch(batch)
-            loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
-
-            total_loss += loss.item()
-
-            # Update progress bar with latest loss
-            progress_bar.set_postfix(loss=loss.item())
-
-            # Update Wandb step loss
-            wandb.log({'step_loss': loss.item()})
-
-        return total_loss
-
-    def process_batch(self, batch):
-        question_embeddings = self.model(batch['question_ids'], batch['question_mask']).last_hidden_state[:, 0, :]
-        step_embeddings = self.model(batch['step_ids'], batch['step_mask']).last_hidden_state[:, 0, :]
-        kc_embeddings = self.model(batch['kc_ids'], batch['kc_mask']).last_hidden_state[:, 0, :]
-
-        # Calculate similarities
-        # kc_question_similarity = F.cosine_similarity(kc_embeddings.unsqueeze(1), question_embeddings.unsqueeze(0), dim=2)
-        # kc_step_similarity = F.cosine_similarity(kc_embeddings.unsqueeze(1), step_embeddings.unsqueeze(0), dim=2)
-        question_kc_similarity =  F.cosine_similarity(question_embeddings.unsqueeze(1), kc_embeddings.unsqueeze(0), dim=2)
-        step_kc_similarity = F.cosine_similarity(step_embeddings.unsqueeze(1), kc_embeddings.unsqueeze(0), dim=2)
-
-        # Continue as normal
-        # kc_question_score = torch.exp(kc_question_similarity / self.T)
-        # kc_step_score = torch.exp(kc_step_similarity / self.T)
-        question_kc_score = torch.exp(question_kc_similarity / self.T)
-        step_kc_score = torch.exp(step_kc_similarity / self.T)
-
-        # loss = self.contrastive_loss(kc_question_score, batch['kc_quest_pairs'], batch['cluster_kc_quest_pairs']) + \
-        #     self.alpha * self.contrastive_loss(kc_step_score, batch['kc_step_pairs'], batch['cluster_kc_step_pairs'])
-        
-        loss = self.contrastive_loss(question_kc_score, batch['kc_quest_pairs'], batch['cluster_kc_quest_pairs']) + \
-            self.alpha * self.contrastive_loss(step_kc_score, batch['kc_step_pairs'], batch['cluster_kc_step_pairs'])
-
-        #print("Loss:", loss.item())
-        return loss
-
-
-    def contrastive_loss(self, score_matrix, direct_pair_indices, clustered_pair_indices):
-        pos_mask = torch.zeros_like(score_matrix)
-        neg_mask = torch.ones_like(score_matrix)
-        
-        # We treat all the direct kc - quest/step pairs as positives
-        pos_mask[direct_pair_indices[:, 1], direct_pair_indices[:, 0]] = 1
-        neg_mask[direct_pair_indices[:, 1], direct_pair_indices[:, 0]] = 0
-        
-        # We discard all clustered kc - quest/step pairs as from negatives (in default mode)
-        if not self.disable_clusters:
-            neg_mask[clustered_pair_indices[:, 1], clustered_pair_indices[:, 0]] = 0
-        
-        pos_score = score_matrix * pos_mask
-        neg_score = score_matrix * neg_mask
-
-        pos_score_sum = pos_score.sum(dim=-1)
-        neg_score_sum = neg_score.sum(dim=-1)
-
-        # Check for any zeros or very small numbers in the denominator
-        scores_sum = pos_score_sum + neg_score_sum
-
-        # Safe-guarding against division by zero or log of zero
-        scores_sum = scores_sum.clamp(min=1e-8)  # Avoid division by zero
-        pos_score_sum = pos_score_sum.clamp(min=1e-8)  # Avoid log(0)
-
-        # Calculate the loss for each element in pos_score
-        safe_pos_score = pos_score.clamp(min=1e-8)
-        element_loss = -1 * torch.log(safe_pos_score / scores_sum.unsqueeze(-1))
-
-        # Mask out the elements that are zero in pos_score
-        element_loss = element_loss * pos_mask
-
-        # Calculate the mean loss for each row, considering only non-zero elements
-        row_loss = element_loss.sum(dim=-1) / pos_mask.sum(dim=-1).clamp(min=1e-8)
-
-        # Filter out rows where pos_mask has no positives
-        valid_rows = pos_mask.sum(dim=-1) > 0  # Boolean mask of rows with at least one positive
-        row_loss = row_loss[valid_rows]  # Filter to include only valid rows
-
-        # Compute the mean loss over valid rows only
-        cl_loss = row_loss.mean()
-
-        return cl_loss
-
-
-    def _batch_to_device(self, batch):
-        for k in batch:
-            if torch.is_tensor(batch[k]):
-                batch[k] = batch[k].to(self.device)
-        return batch
-
-    def save_model(self):
-        # Define a directory to save the model and tokenizer
-        model_dir = self.model_save_dir
-        if not os.path.exists(model_dir):
-            os.makedirs(model_dir)
-
-        # Save the model
-        model_save_path = os.path.join(model_dir, 'bert_finetuned.bin')
-        torch.save(self.model.state_dict(), model_save_path)
+        q_matrix, item_bank, max_item, rows, q_col, r_col, ncdm, agent = self._load()
+        logs = []
+        for epoch in range(self.episodes):
+            rewards=[]; aloss=[]; closs=[]; noise_std=max(0.05, 0.5 - epoch * 0.05)
+            for _, row in tqdm(rows.iterrows(), total=len(rows), desc=f"DDPG epoch {epoch+1}/{self.episodes}"):
+                items, responses = clean_sequence(row[q_col], row[r_col], max_item)
+                if len(items) < 4: continue
+                order = list(range(len(items))); random.shuffle(order); split = max(1, int(len(order)*0.7))
+                avail_i=[items[i] for i in order[:split]]; avail_r=[responses[i] for i in order[:split]]; val_i=[items[i] for i in order[split:]]
+                seed_idx=random.randrange(len(avail_i)); cur_i=avail_i.pop(seed_idx); cur_r=avail_r.pop(seed_idx)
+                hist_i=[cur_i]; hist_r=[cur_r]; hx,cx=agent.actor.init_hidden(1,self.device)
+                for step in range(self.horizon):
+                    if not avail_i: break
+                    prev_ent=self._entropy(ncdm,q_matrix,hist_i,hist_r,val_i)
+                    tid=torch.tensor([cur_i],device=self.device)
+                    sem=item_bank[cur_i]; q=q_matrix[cur_i]; diff=torch.sigmoid(ncdm.k_difficulty(tid)).squeeze(0); disc=torch.sigmoid(ncdm.e_discrimination(tid)).squeeze(0)
+                    with torch.no_grad():
+                        ideal,nh,nc=agent.actor(sem.unsqueeze(0),q.unsqueeze(0),diff.unsqueeze(0),disc.unsqueeze(0),torch.tensor([cur_r],device=self.device),hx,cx)
+                        noisy=torch.clamp(ideal + torch.randn_like(ideal)*noise_std,0,1)
+                    loc=self.select_candidate(noisy,avail_i,q_matrix,ncdm); next_i=avail_i.pop(loc); next_r=avail_r.pop(loc)
+                    hist_i.append(next_i); hist_r.append(next_r)
+                    curr_ent=self._entropy(ncdm,q_matrix,hist_i,hist_r,val_i); reward=information_gain_reward(prev_ent,curr_ent); rewards.append(reward)
+                    nt=torch.tensor([next_i],device=self.device); ndiff=torch.sigmoid(ncdm.k_difficulty(nt)).squeeze(0); ndisc=torch.sigmoid(ncdm.e_discrimination(nt)).squeeze(0)
+                    done=float(step == self.horizon-1 or not avail_i)
+                    self.buffer.push(hx.squeeze(0).detach().cpu().numpy(), cx.squeeze(0).detach().cpu().numpy(), sem.cpu().numpy(), q.cpu().numpy(), diff.cpu().numpy(), disc.cpu().numpy(), cur_r, noisy.squeeze(0).cpu().numpy(), reward, item_bank[next_i].cpu().numpy(), q_matrix[next_i].cpu().numpy(), ndiff.cpu().numpy(), ndisc.cpu().numpy(), next_r, done)
+                    hx,cx=nh.detach(),nc.detach(); cur_i,cur_r=next_i,next_r
+                    metrics=self.optimize(agent)
+                    if metrics: aloss.append(metrics[0]); closs.append(metrics[1])
+                    if done: break
+            log={"epoch":epoch+1,"reward":float(np.mean(rewards)) if rewards else 0.0,"actor_loss":float(np.mean(aloss)) if aloss else 0.0,"critic_loss":float(np.mean(closs)) if closs else 0.0}
+            logs.append(log); print(f"Epoch {log['epoch']} reward={log['reward']:.4f} actor_loss={log['actor_loss']:.4f} critic_loss={log['critic_loss']:.4f}")
+        out=self.output_dir/"ddpg_actor.pt"; torch.save(agent.actor.state_dict(), out)
+        return logs, out
