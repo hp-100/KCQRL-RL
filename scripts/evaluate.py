@@ -29,6 +29,7 @@ def main(argv=None) -> int:
     parser.add_argument("--max-students", type=int, default=None, help="Maximum students for benchmark_v2.")
     parser.add_argument("--steps", default=None, help="Comma-separated benchmark checkpoints.")
     parser.add_argument("--output-dir", default=None, help="benchmark_v2 output directory.")
+    parser.add_argument("--policies", default=None, help="Comma-separated benchmark_v2 policies to run.")
     args = parser.parse_args(argv)
 
     config_path = Path(args.config)
@@ -40,7 +41,8 @@ def main(argv=None) -> int:
         if protocol == "benchmark_v2":
             seeds = [int(x) for x in args.seeds.split(",")] if args.seeds else None
             steps = [int(x) for x in args.steps.split(",")] if args.steps else None
-            evaluator = BenchmarkV2Evaluator(config, debug=args.debug, ddpg_checkpoint=args.ddpg_checkpoint, seeds=seeds, max_students=args.max_students, steps=steps, output_dir=args.output_dir)
+            policies = [x.strip() for x in args.policies.split(",") if x.strip()] if args.policies else None
+            evaluator = BenchmarkV2Evaluator(config, debug=args.debug, ddpg_checkpoint=args.ddpg_checkpoint, seeds=seeds, max_students=args.max_students, steps=steps, output_dir=args.output_dir, policies=policies)
             rows = evaluator.run()
             print(f"benchmark_v2 complete: wrote outputs to {evaluator.output_dir}")
             print("policy,seed,step,students,accuracy_micro,auc_micro,nll_micro,brier_micro")

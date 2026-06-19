@@ -19,6 +19,9 @@ class StudentSplit:
     warm_start_item: int
     warm_start_response: float
     seed: int
+    original_interactions: int = 0
+    valid_interactions: int = 0
+    duplicate_interactions_removed: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -36,8 +39,12 @@ def student_rng(student_id: str, seed: int) -> random.Random:
     return random.Random(int(digest[:16], 16))
 
 
-def clean_interactions(item_ids: Sequence[int], responses: Sequence[float], max_item_id: int) -> tuple[list[int], list[float]]:
+def clean_interactions_with_stats(item_ids: Sequence[int], responses: Sequence[float], max_item_id: int) -> tuple[list[int], list[float], int, int, int]:
+    original = min(len(item_ids), len(responses))
     cleaned_i, cleaned_r = [], []
+    seen: set[int] = set()
+    duplicates = 0
+    valid_before_dedupe = 0
     for item, resp in zip(item_ids, responses):
         try:
             item = int(item)
@@ -45,13 +52,23 @@ def clean_interactions(item_ids: Sequence[int], responses: Sequence[float], max_
         except (TypeError, ValueError):
             continue
         if 0 <= item < max_item_id and resp == resp:
+            valid_before_dedupe += 1
+            if item in seen:
+                duplicates += 1
+                continue
+            seen.add(item)
             cleaned_i.append(item)
             cleaned_r.append(1.0 if resp >= 0.5 else 0.0)
-    return cleaned_i, cleaned_r
+    return cleaned_i, cleaned_r, original, valid_before_dedupe, duplicates
+
+
+def clean_interactions(item_ids: Sequence[int], responses: Sequence[float], max_item_id: int) -> tuple[list[int], list[float]]:
+    items, responses, *_ = clean_interactions_with_stats(item_ids, responses, max_item_id)
+    return items, responses
 
 
 def make_student_split(student_id: str, item_ids: Sequence[int], responses: Sequence[float], *, seed: int, valid_count: int, query_ratio: float = 0.2, min_query_items: int = 5) -> tuple[StudentSplit | None, str | None]:
-    items, resps = clean_interactions(item_ids, responses, valid_count)
+    items, resps, original_interactions, valid_interactions, duplicate_interactions_removed = clean_interactions_with_stats(item_ids, responses, valid_count)
     paired = list(zip(items, resps))
     if len(paired) < min_query_items + 2:
         return None, "too_few_valid_interactions"
@@ -66,6 +83,7 @@ def make_student_split(student_id: str, item_ids: Sequence[int], responses: Sequ
     query = [paired[i] for i in order[:query_n]]
     if not support or not query:
         return None, "empty_split"
+    assert set(i for i, _ in support).isdisjoint(set(i for i, _ in query)), "support/query item leakage"
     warm_item, warm_resp = support[0]
     return StudentSplit(
         student_id=str(student_id),
@@ -76,6 +94,9 @@ def make_student_split(student_id: str, item_ids: Sequence[int], responses: Sequ
         warm_start_item=int(warm_item),
         warm_start_response=float(warm_resp),
         seed=int(seed),
+        original_interactions=int(original_interactions),
+        valid_interactions=int(valid_interactions),
+        duplicate_interactions_removed=int(duplicate_interactions_removed),
     ), None
 
 

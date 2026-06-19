@@ -19,7 +19,7 @@ from models.actor import LSTMActor
 
 
 class BenchmarkV2Evaluator:
-    def __init__(self, config: Mapping, *, debug=False, ddpg_checkpoint="outputs/ddpg_actor.pt", seeds=None, max_students=None, steps=None, output_dir=None):
+    def __init__(self, config: Mapping, *, debug=False, ddpg_checkpoint="outputs/ddpg_actor.pt", seeds=None, max_students=None, steps=None, output_dir=None, policies=None):
         self.config = dict(config)
         b = dict((config.get("benchmark") or {}))
         self.debug = debug
@@ -28,6 +28,8 @@ class BenchmarkV2Evaluator:
         self.max_students = int(max_students if max_students is not None else b.get("max_students", 20 if debug else 300))
         self.query_ratio = float(b.get("query_ratio", 0.2)); self.min_query_items = int(b.get("min_query_items", 5))
         self.candidate_size = b.get("candidate_size", None)
+        configured_policies = b.get("policies", ["Random", "MIRT-MFI", "MIRT-KLI", "DDPG", "OneStepOracle"])
+        self.policy_names = [str(x) for x in (policies if policies is not None else configured_policies)]
         self.save_predictions = bool(b.get("save_predictions", True)); self.save_traces = bool(b.get("save_traces", True))
         self.output_dir = Path(output_dir or b.get("output_dir", "results/benchmark_v2"))
         self.ddpg_checkpoint = Path(ddpg_checkpoint)
@@ -54,7 +56,10 @@ class BenchmarkV2Evaluator:
                     return torch.sigmoid((disc*(torch.sigmoid(alpha)-diff)*q_matrix[exer_id]).sum(dim=-1))
             ncdm = TinyNCDM(len(q), q.shape[1]).to(self.device).eval()
             return q, item_bank, seqs[:self.max_students], ncdm, True
-        q, item_bank, seqs = legacy.load()
+        legacy.ensure_assets()
+        q = legacy._load_array(legacy.paths["q_matrix"]).astype(np.float32)
+        item_bank = legacy._load_array(legacy.paths["item_bank"]).astype(np.float32)
+        seqs = legacy._load_sequences(legacy.paths["test_sequences"])
         ncdm = OfficialNCDM(1, q.shape[0], q.shape[1]).to(self.device)
         safe_load_ncdm_checkpoint(ncdm, legacy.paths["ncdm_checkpoint"], self.device)
         ncdm.eval()
@@ -69,14 +74,20 @@ class BenchmarkV2Evaluator:
         return [float(x) for x in out.detach().cpu().tolist()]
 
     def _policies(self, q, item_bank, ncdm, synthetic):
-        policies=[RandomPolicy(), HeuristicMIRTPolicy("MIRT-MFI"), HeuristicMIRTPolicy("MIRT-KLI"), OneStepOraclePolicy()]
-        try:
-            actor=None; q_t=torch.tensor(q,dtype=torch.float32,device=self.device); ib_t=torch.tensor(item_bank,dtype=torch.float32,device=self.device)
-            if self.ddpg_checkpoint.exists():
-                actor=LSTMActor(semantic_dim=item_bank.shape[1], q_dim=q.shape[1]).to(self.device); actor.load_state_dict(torch.load(self.ddpg_checkpoint,map_location=self.device)); actor.eval()
-            policies.insert(3, DDPGPolicy(self.ddpg_checkpoint, actor=actor, q_matrix=q_t, item_bank=ib_t, ncdm=ncdm, device=self.device, allow_debug_fallback=self.debug or synthetic))
-        except FileNotFoundError as e:
-            raise
+        q_t=torch.tensor(q,dtype=torch.float32,device=self.device)
+        ib_t=torch.nn.functional.normalize(torch.tensor(item_bank,dtype=torch.float32,device=self.device), p=2, dim=1)
+        available={"Random": lambda: RandomPolicy(), "MIRT-MFI": lambda: HeuristicMIRTPolicy("MIRT-MFI"), "MIRT-KLI": lambda: HeuristicMIRTPolicy("MIRT-KLI"), "OneStepOracle": lambda: OneStepOraclePolicy()}
+        policies=[]
+        for name in self.policy_names:
+            if name == "DDPG":
+                actor=None
+                if self.ddpg_checkpoint.exists():
+                    actor=LSTMActor(semantic_dim=item_bank.shape[1], q_dim=q.shape[1]).to(self.device); actor.load_state_dict(torch.load(self.ddpg_checkpoint,map_location=self.device)); actor.eval()
+                policies.append(DDPGPolicy(self.ddpg_checkpoint, actor=actor, q_matrix=q_t, item_bank=ib_t, ncdm=ncdm, device=self.device, allow_debug_fallback=self.debug or synthetic))
+            elif name in available:
+                policies.append(available[name]())
+            else:
+                raise ValueError(f"Unknown benchmark policy: {name}")
         return policies
 
     def run(self):
@@ -93,6 +104,7 @@ class BenchmarkV2Evaluator:
                 else: skipped[seq.student_id]=reason or "invalid"
             save_manifest(self.output_dir/f"splits_seed{seed}.json", splits, skipped, {"seed":seed,"query_ratio":self.query_ratio,"min_query_items":self.min_query_items})
             policies=self._policies(q, item_bank, ncdm, synthetic)
+            expected_evaluated_by_step={}
             for pol in policies: metadata[pol.name]=pol.metadata.__dict__
             for pol in policies:
                 step_pred=defaultdict(lambda: ([],[])); step_stu=defaultdict(list); exposures=defaultdict(Counter); q_inter=defaultdict(int)
@@ -108,8 +120,11 @@ class BenchmarkV2Evaluator:
                     for t in range(0, max_extra+1):
                         if t in checkpoints:
                             scores=self._predict(ncdm, q_tensor, hist_i, hist_r, sp.query_item_ids)
-                            step_pred[t][0].extend(sp.query_responses); step_pred[t][1].extend(scores); q_inter[t]+=len(sp.query_item_ids)
-                            mb=metric_bundle(sp.query_responses, scores); step_stu[t].append(mb)
+                            if scores:
+                                step_pred[t][0].extend(sp.query_responses); step_pred[t][1].extend(scores); q_inter[t]+=len(sp.query_item_ids)
+                                mb=metric_bundle(sp.query_responses, scores); step_stu[t].append(mb)
+                            else:
+                                mb={k: float('nan') for k in ["accuracy","auc","nll","brier"]}
                             for qi,yt,ys in zip(sp.query_item_ids, sp.query_responses, scores):
                                 pred_rows.append({"seed":seed,"policy":pol.name,"student_id":sp.student_id,"step":t,"query_item_id":qi,"y_true":yt,"y_score":ys})
                             student_rows.append({"seed":seed,"policy":pol.name,"student_id":sp.student_id,"step":t,**{k:v for k,v in mb.items()}})
@@ -121,11 +136,15 @@ class BenchmarkV2Evaluator:
                         cand.remove(item); resp=cresp[item]; hist_i.append(item); hist_r.append(resp); selected.append(item); selected_r.append(resp); exposures[t+1][item]+=1
                     traces.append({"student_id":sp.student_id,"policy":pol.name,"seed":seed,"warm_start_item":sp.warm_start_item,"selected_items":selected,"selected_responses":selected_r,"query_items":sp.query_item_ids})
                 for step in self.steps:
-                    yt,ys=step_pred[step]; micro=metric_bundle(yt,ys); macros={k:nanmean([m[k] for m in step_stu[step]]) for k in ["accuracy","auc","nll","brier"]}
+                    yt,ys=step_pred[step]; evaluated_students=len(step_stu[step]); eligible_students=sum(1 for sp in splits if len(sp.support_item_ids) - 1 >= step); incomplete_students=len(splits)-evaluated_students
+                    if step in expected_evaluated_by_step and expected_evaluated_by_step[step] != evaluated_students:
+                        raise RuntimeError(f"evaluated_students mismatch at seed={seed} step={step}: expected {expected_evaluated_by_step[step]}, got {evaluated_students} for {pol.name}")
+                    expected_evaluated_by_step.setdefault(step, evaluated_students)
+                    micro=metric_bundle(yt,ys); macros={k:nanmean([m[k] for m in step_stu[step]]) for k in ["accuracy","auc","nll","brier"]}
                     cnt=Counter(); [cnt.update(c) for s,c in exposures.items() if s<=step]
                     concepts=set();
                     for item in cnt: concepts.update(np.nonzero(q[item])[0].tolist())
-                    all_rows.append({"policy":pol.name,"seed":seed,"step":step,"students":len(splits),"valid_students":len(splits),"skipped_students":len(skipped),"query_interactions":q_inter[step],"selected_items":sum(cnt.values()),"average_test_length":(sum(cnt.values())/len(splits) if splits else 0),"accuracy_micro":micro["accuracy"],"auc_micro":micro["auc"],"nll_micro":micro["nll"],"brier_micro":micro["brier"],"accuracy_macro":macros["accuracy"],"auc_macro":macros["auc"],"nll_macro":macros["nll"],"brier_macro":macros["brier"],"concept_coverage":len(concepts)/q.shape[1],"unique_item_count":len(cnt),"item_exposure_max":max(cnt.values()) if cnt else 0,"item_exposure_gini":gini(cnt.values())})
+                    all_rows.append({"policy":pol.name,"seed":seed,"step":step,"students":evaluated_students,"eligible_students":eligible_students,"evaluated_students":evaluated_students,"incomplete_students":incomplete_students,"valid_students":len(splits),"skipped_students":len(skipped),"query_interactions":q_inter[step],"selected_items":sum(cnt.values()),"average_test_length":(sum(cnt.values())/evaluated_students if evaluated_students else 0),"accuracy_micro":micro["accuracy"],"auc_micro":micro["auc"],"nll_micro":micro["nll"],"brier_micro":micro["brier"],"accuracy_macro":macros["accuracy"],"auc_macro":macros["auc"],"nll_macro":macros["nll"],"brier_macro":macros["brier"],"concept_coverage":len(concepts)/q.shape[1],"unique_item_count":len(cnt),"item_exposure_max":max(cnt.values()) if cnt else 0,"item_exposure_gini":gini(cnt.values())})
         self._write_csv(self.output_dir/"per_seed.csv", all_rows)
         agg=[]
         for key in sorted({(r['policy'],r['step']) for r in all_rows}):
@@ -141,7 +160,10 @@ class BenchmarkV2Evaluator:
             with (self.output_dir/"traces.jsonl").open('w') as f:
                 for tr in traces: f.write(json.dumps(tr)+"\n")
         (self.output_dir/"policy_metadata.json").write_text(json.dumps(metadata,indent=2))
-        (self.output_dir/"run_config.yaml").write_text(yaml.safe_dump(self.config))
+        run_config=dict(self.config)
+        run_config["benchmark"]={**dict(run_config.get("benchmark") or {}), "protocol":"benchmark_v2", "seeds":self.seeds, "max_students":self.max_students, "steps":self.steps, "output_dir":str(self.output_dir), "candidate_size":self.candidate_size, "ddpg_checkpoint":str(self.ddpg_checkpoint), "policies":self.policy_names, "device":str(self.device), "synthetic":bool(synthetic), "debug":bool(self.debug)}
+        run_config["device"] = str(self.device)
+        (self.output_dir/"run_config.yaml").write_text(yaml.safe_dump(run_config))
         return all_rows
 
     @staticmethod
