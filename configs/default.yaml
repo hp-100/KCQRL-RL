@@ -39,6 +39,12 @@ training:
 
 benchmark:
   protocol: legacy
+  policies:
+    - Random
+    - MIRT-MFI
+    - MIRT-KLI
+    - DDPG
+    - OneStepOracle
   evaluator_model: ncdm
   query_ratio: 0.2
   min_query_items: 5
