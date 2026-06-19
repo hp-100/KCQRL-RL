@@ -42,9 +42,9 @@ def main(argv=None) -> int:
         print(f"KCQRL-RL evaluation failed: {exc}", file=sys.stderr)
         return 1
 
-    print("policy,students,interactions,accuracy,reward")
+    print("policy,students,interactions,accuracy,auc,nll,brier,reward")
     for r in results:
-        print(f"{r.policy},{r.students},{r.interactions},{r.accuracy:.4f},{r.reward:.4f}")
+        print(f"{r.policy},{r.students},{r.interactions},{r.accuracy:.4f},{r.auc:.4f},{r.nll:.4f},{r.brier:.4f},{r.reward:.4f}")
     return 0
 
 

@@ -39,6 +39,9 @@ class EvaluationResult:
     students: int
     interactions: int
     accuracy: float
+    auc: float
+    nll: float
+    brier: float
     reward: float
 
 
@@ -191,6 +194,8 @@ class CATOfflineEvaluator:
     def _evaluate_policy(self, policy: str, q_matrix, item_bank, sequences: Sequence[StudentSequence]) -> EvaluationResult:
         correct = interactions = 0
         reward_sum = 0.0
+        y_true: List[float] = []
+        y_score: List[float] = []
         for seq in sequences:
             ability = np.zeros(q_matrix.shape[1], dtype=float)
             seen = set()
@@ -206,13 +211,19 @@ class CATOfflineEvaluator:
                 seen.add(item)
                 response = seq.responses[seq.item_ids.index(item)]
                 pred = self._predict(ability, q_matrix[item])
+                y_true.append(float(response >= 0.5))
+                y_score.append(pred)
                 correct += int((pred >= 0.5) == (response >= 0.5))
                 reward_sum += 1.0 if (pred >= 0.5) == (response >= 0.5) else 0.0
                 ability += (response - pred) * q_matrix[item]
                 last_item, last_response = item, response
                 interactions += 1
         acc = correct / interactions if interactions else 0.0
-        return EvaluationResult(policy, len(sequences), interactions, acc, reward_sum / interactions if interactions else 0.0)
+        auc = self._auc_score(y_true, y_score) if interactions else float("nan")
+        nll = self._binary_cross_entropy(y_true, y_score) if interactions else 0.0
+        brier = self._brier_score(y_true, y_score) if interactions else 0.0
+        reward = reward_sum / interactions if interactions else 0.0
+        return EvaluationResult(policy, len(sequences), interactions, acc, auc, nll, brier, reward)
 
     def _select(self, policy: str, candidates: Sequence[int], ability, q_matrix, item_bank, seq: StudentSequence, ddpg_hx=None, ddpg_cx=None, last_item=None, last_response=None):
         if policy == "Random":
@@ -256,3 +267,47 @@ class CATOfflineEvaluator:
         denom = max(float(np.linalg.norm(q_vec)), 1.0)
         z = float(np.dot(ability, q_vec) / denom)
         return 1.0 / (1.0 + math.exp(-max(min(z, 30.0), -30.0)))
+
+    @staticmethod
+    def _auc_score(y_true: Sequence[float], y_score: Sequence[float]) -> float:
+        """Compute binary ROC AUC with average ranks for tied scores.
+
+        This rank-based implementation is equivalent to the Mann-Whitney U
+        statistic. It returns NaN when AUC is undefined because only one class is
+        present in ``y_true``.
+        """
+        positives = sum(1 for y in y_true if y >= 0.5)
+        negatives = len(y_true) - positives
+        if positives == 0 or negatives == 0:
+            return float("nan")
+
+        ranked = sorted(zip(y_score, y_true), key=lambda pair: pair[0])
+        pos_rank_sum = 0.0
+        i = 0
+        while i < len(ranked):
+            j = i + 1
+            while j < len(ranked) and ranked[j][0] == ranked[i][0]:
+                j += 1
+            avg_rank = (i + 1 + j) / 2.0
+            pos_rank_sum += avg_rank * sum(1 for _, y in ranked[i:j] if y >= 0.5)
+            i = j
+
+        return (pos_rank_sum - positives * (positives + 1) / 2.0) / (positives * negatives)
+
+    @staticmethod
+    def _binary_cross_entropy(y_true: Sequence[float], y_score: Sequence[float]) -> float:
+        eps = 1e-7
+        total = 0.0
+        for y, p in zip(y_true, y_score):
+            clipped = min(max(float(p), eps), 1.0 - eps)
+            total += -(float(y) * math.log(clipped) + (1.0 - float(y)) * math.log(1.0 - clipped))
+        return total / len(y_true) if y_true else 0.0
+
+    @staticmethod
+    def _brier_score(y_true: Sequence[float], y_score: Sequence[float]) -> float:
+        eps = 1e-7
+        total = 0.0
+        for y, p in zip(y_true, y_score):
+            clipped = min(max(float(p), eps), 1.0 - eps)
+            total += (clipped - float(y)) ** 2
+        return total / len(y_true) if y_true else 0.0
