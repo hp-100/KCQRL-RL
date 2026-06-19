@@ -25,9 +25,13 @@ class SequenceReplayBuffer:
     def sample(self, batch_sequences:int, burn_in_length:int, unroll_length:int, device='cpu'):
         if not self.episodes: raise ValueError('cannot sample empty SequenceReplayBuffer')
         total=int(burn_in_length)+int(unroll_length); batch=[]
+        eligible=[ep for ep in self.episodes if len(ep.states)>int(burn_in_length)]
+        if not eligible:
+            raise ValueError('no SequenceReplayBuffer episodes contain at least one valid unroll timestep')
         for _ in range(int(batch_sequences)):
-            ep=self.rng.choice(self.episodes); T=len(ep.states)
-            start=0 if T<=total else self.rng.randint(0, T-total)
+            ep=self.rng.choice(eligible); T=len(ep.states)
+            max_start=max(0, T-int(burn_in_length)-1)
+            start=0 if max_start==0 else self.rng.randint(0, max_start)
             end=min(T, start+total); valid=end-start; pad=total-valid
             def sl(x, tail_shape):
                 arr=x[start:end]
@@ -36,4 +40,7 @@ class SequenceReplayBuffer:
             batch.append((sl(ep.states,(ep.states.shape[1],)), sl(ep.actions,(ep.actions.shape[1],)), sl(ep.rewards.reshape(-1,1),(1,)), sl(ep.next_states,(ep.next_states.shape[1],)), sl(ep.dones.reshape(-1,1),(1,)), np.concatenate([np.ones((valid,1),np.float32), np.zeros((pad,1),np.float32)],0)))
         cols=list(zip(*batch))
         names=['states','actions','rewards','next_states','dones','valid_mask']
-        return {n:torch.as_tensor(np.stack(c),device=device,dtype=torch.float32) for n,c in zip(names,cols)}
+        out={n:torch.as_tensor(np.stack(c),device=device,dtype=torch.float32) for n,c in zip(names,cols)}
+        if out['valid_mask'][:, int(burn_in_length):].sum().item() == 0:
+            raise ValueError('sampled batch has zero valid unroll timesteps')
+        return out

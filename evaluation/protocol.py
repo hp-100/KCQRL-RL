@@ -6,7 +6,7 @@ import hashlib
 import json
 import random
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 
 @dataclass
@@ -23,8 +23,42 @@ class StudentSplit:
     valid_interactions: int = 0
     duplicate_interactions_removed: int = 0
 
+    @property
+    def candidate_items(self) -> list[int]:
+        return [int(i) for i in self.support_item_ids if int(i) != int(self.warm_start_item)]
+
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        d["candidate_items"] = self.candidate_items
+        d["query_items"] = list(self.query_item_ids)
+        return d
+
+
+
+THETA_FIT_KEYS = ("steps", "lr", "theta_l2", "grad_clip", "early_stop_tol")
+
+def canonical_theta_fit(config: dict | None = None, *, smoke: bool = False) -> dict:
+    cfg = dict(config or {})
+    defaults = {"steps": 5 if smoke else 30, "lr": 0.05, "theta_l2": 0.01, "grad_clip": 5.0, "early_stop_tol": 1.0e-5}
+    out = {k: cfg.get(k, defaults[k]) for k in THETA_FIT_KEYS}
+    out["steps"] = int(out["steps"])
+    for k in ("lr", "theta_l2", "grad_clip", "early_stop_tol"):
+        out[k] = float(out[k])
+    return out
+
+def assert_theta_fit_equal(a: dict, b: dict, *, label_a: str = "left", label_b: str = "right") -> None:
+    ca, cb = canonical_theta_fit(a), canonical_theta_fit(b)
+    if ca != cb:
+        raise ValueError(f"theta_fit mismatch between {label_a} and {label_b}: {ca} != {cb}")
+
+def selection_horizon_from_config(config: Mapping | dict, *, default: int | None = None) -> int:
+    # Intentionally no implicit 20 here: callers must pass configured max_steps/selection_horizon.
+    b = dict((config.get("benchmark") or {})) if isinstance(config, dict) else {}
+    t = dict((config.get("training") or {})) if isinstance(config, dict) else {}
+    val = b.get("selection_horizon", t.get("selection_horizon", t.get("max_steps", default)))
+    if val is None:
+        raise ValueError("selection_horizon must be configured explicitly")
+    return int(val)
 
 
 def valid_item_count(q_matrix, item_bank=None, ncdm=None, mirt=None, *, track: str | None = None) -> int:
