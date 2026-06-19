@@ -25,6 +25,7 @@ def main(argv=None) -> int:
     parser.add_argument("--debug", action="store_true", help="Use small debug limits and print friendly diagnostics.")
     parser.add_argument("--ddpg-checkpoint", default="outputs/ddpg_actor.pt", help="Path to trained DDPG actor checkpoint.")
     parser.add_argument("--ddpg-mirt-checkpoint", default=None, help="Path to trained DDPG-MIRT actor checkpoint.")
+    parser.add_argument("--rdpg-mirt-checkpoint", default=None, help="Path to trained RDPG-MIRT actor checkpoint.")
     parser.add_argument("--track", default=None, help="Evaluation track, e.g. mirt_native.")
     parser.add_argument("--protocol", default=None, help="Evaluation protocol: legacy or benchmark_v2.")
     parser.add_argument("--seeds", default=None, help="Comma-separated benchmark seeds.")
@@ -44,7 +45,7 @@ def main(argv=None) -> int:
             seeds = [int(x) for x in args.seeds.split(",")] if args.seeds else None
             steps = [int(x) for x in args.steps.split(",")] if args.steps else None
             policies = [x.strip() for x in args.policies.split(",") if x.strip()] if args.policies else None
-            evaluator = BenchmarkV2Evaluator(config, debug=args.debug, ddpg_checkpoint=args.ddpg_checkpoint, ddpg_mirt_checkpoint=args.ddpg_mirt_checkpoint, track=args.track, seeds=seeds, max_students=args.max_students, steps=steps, output_dir=args.output_dir, policies=policies)
+            evaluator = BenchmarkV2Evaluator(config, debug=args.debug, ddpg_checkpoint=args.ddpg_checkpoint, ddpg_mirt_checkpoint=args.ddpg_mirt_checkpoint, rdpg_mirt_checkpoint=args.rdpg_mirt_checkpoint, track=args.track, seeds=seeds, max_students=args.max_students, steps=steps, output_dir=args.output_dir, policies=policies)
             rows = evaluator.run()
             print(f"benchmark_v2 complete: wrote outputs to {evaluator.output_dir}")
             print("policy,seed,step,students,accuracy_micro,auc_micro,nll_micro,brier_micro")

@@ -13,14 +13,14 @@ import yaml
 from evaluation.offline_eval import CATOfflineEvaluator, MissingAssetsError, StudentSequence
 from evaluation.metrics import metric_bundle, nanmean, gini, nll_score
 from evaluation.protocol import StudentSplit, make_student_split, save_manifest, valid_item_count
-from evaluation.policies import RandomPolicy, HeuristicMIRTPolicy, FormalMIRTPolicy, DDPGPolicy, OneStepOraclePolicy, DDPGMIRTPolicy, RandomMIRTPolicy
+from evaluation.policies import RandomPolicy, HeuristicMIRTPolicy, FormalMIRTPolicy, DDPGPolicy, OneStepOraclePolicy, DDPGMIRTPolicy, RandomMIRTPolicy, RDPGMIRTPolicy
 from models.ncdm import OfficialNCDM, fit_student_alpha, safe_load_ncdm_checkpoint
 from models.mirt import MIRTModel, load_mirt_checkpoint, fit_student_theta as fit_mirt_theta, predict_with_theta as mirt_predict_with_theta
 from models.actor import LSTMActor
 
 
 class BenchmarkV2Evaluator:
-    def __init__(self, config: Mapping, *, debug=False, ddpg_checkpoint="outputs/ddpg_actor.pt", ddpg_mirt_checkpoint=None, track=None, seeds=None, max_students=None, steps=None, output_dir=None, policies=None):
+    def __init__(self, config: Mapping, *, debug=False, ddpg_checkpoint="outputs/ddpg_actor.pt", ddpg_mirt_checkpoint=None, rdpg_mirt_checkpoint=None, track=None, seeds=None, max_students=None, steps=None, output_dir=None, policies=None):
         self.config = dict(config)
         b = dict((config.get("benchmark") or {}))
         self.debug = debug
@@ -35,9 +35,10 @@ class BenchmarkV2Evaluator:
         self.output_dir = Path(output_dir or b.get("output_dir", "results/benchmark_v2"))
         self.ddpg_checkpoint = Path(ddpg_checkpoint)
         self.ddpg_mirt_checkpoint = Path(ddpg_mirt_checkpoint or b.get("ddpg_mirt_checkpoint", "outputs/mirt_ddpg/ddpg_mirt_actor_best.pt"))
+        self.rdpg_mirt_checkpoint = Path(rdpg_mirt_checkpoint or b.get("rdpg_mirt_checkpoint", "outputs/mirt_rdpg/rdpg_mirt_actor_best.pt"))
         self.track = track or b.get("track", "benchmark_v2")
         if self.track == "mirt_native" and policies is None and "policies" not in b:
-            self.policy_names = ["Random-MIRT","MIRT-Trace-MFI","MIRT-D-opt","MIRT-MKLI","DDPG-MIRT"]
+            self.policy_names = ["Random-MIRT","MIRT-Trace-MFI","MIRT-D-opt","MIRT-MKLI","DDPG-MIRT","RDPG-MIRT"]
         self.device = torch.device("cuda" if torch.cuda.is_available() and config.get("device") != "cpu" else "cpu")
 
     def _load_or_synthetic(self):
@@ -113,7 +114,13 @@ class BenchmarkV2Evaluator:
         theta_cfg=self._theta_cfg()
         policies=[]
         for name in self.policy_names:
-            if name == "DDPG-MIRT":
+            if name == "RDPG-MIRT":
+                if mirt is None:
+                    if not (self.debug or synthetic):
+                        raise MissingAssetsError([Path(str((self.config.get("assets") or {}).get("mirt_checkpoint","mirt_checkpoint")))])
+                    mirt = MIRTModel(3, q.shape[0], min(36, q.shape[1])).to(self.device).eval()
+                policies.append(RDPGMIRTPolicy(self.rdpg_mirt_checkpoint, mirt, theta_cfg=theta_cfg, device=self.device))
+            elif name == "DDPG-MIRT":
                 if mirt is None:
                     if not (self.debug or synthetic):
                         raise MissingAssetsError([Path(str((self.config.get("assets") or {}).get("mirt_checkpoint","mirt_checkpoint")))])
