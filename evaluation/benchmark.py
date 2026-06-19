@@ -13,14 +13,14 @@ import yaml
 from evaluation.offline_eval import CATOfflineEvaluator, MissingAssetsError, StudentSequence
 from evaluation.metrics import metric_bundle, nanmean, gini, nll_score
 from evaluation.protocol import StudentSplit, make_student_split, save_manifest, valid_item_count
-from evaluation.policies import RandomPolicy, HeuristicMIRTPolicy, FormalMIRTPolicy, DDPGPolicy, OneStepOraclePolicy
+from evaluation.policies import RandomPolicy, HeuristicMIRTPolicy, FormalMIRTPolicy, DDPGPolicy, OneStepOraclePolicy, DDPGMIRTPolicy, RandomMIRTPolicy
 from models.ncdm import OfficialNCDM, fit_student_alpha, safe_load_ncdm_checkpoint
-from models.mirt import MIRTModel, load_mirt_checkpoint
+from models.mirt import MIRTModel, load_mirt_checkpoint, fit_student_theta as fit_mirt_theta, predict_with_theta as mirt_predict_with_theta
 from models.actor import LSTMActor
 
 
 class BenchmarkV2Evaluator:
-    def __init__(self, config: Mapping, *, debug=False, ddpg_checkpoint="outputs/ddpg_actor.pt", seeds=None, max_students=None, steps=None, output_dir=None, policies=None):
+    def __init__(self, config: Mapping, *, debug=False, ddpg_checkpoint="outputs/ddpg_actor.pt", ddpg_mirt_checkpoint=None, track=None, seeds=None, max_students=None, steps=None, output_dir=None, policies=None):
         self.config = dict(config)
         b = dict((config.get("benchmark") or {}))
         self.debug = debug
@@ -34,6 +34,10 @@ class BenchmarkV2Evaluator:
         self.save_predictions = bool(b.get("save_predictions", True)); self.save_traces = bool(b.get("save_traces", True))
         self.output_dir = Path(output_dir or b.get("output_dir", "results/benchmark_v2"))
         self.ddpg_checkpoint = Path(ddpg_checkpoint)
+        self.ddpg_mirt_checkpoint = Path(ddpg_mirt_checkpoint or b.get("ddpg_mirt_checkpoint", "outputs/mirt_ddpg/ddpg_mirt_actor_best.pt"))
+        self.track = track or b.get("track", "benchmark_v2")
+        if self.track == "mirt_native" and policies is None:
+            self.policy_names = ["Random-MIRT","MIRT-Trace-MFI","MIRT-D-opt","MIRT-MKLI","DDPG-MIRT"]
         self.device = torch.device("cuda" if torch.cuda.is_available() and config.get("device") != "cpu" else "cpu")
 
     def _load_or_synthetic(self):
@@ -88,13 +92,19 @@ class BenchmarkV2Evaluator:
             mirt = getattr(self, "mirt_model", None)
         q_t=torch.tensor(q,dtype=torch.float32,device=self.device)
         ib_t=torch.nn.functional.normalize(torch.tensor(item_bank,dtype=torch.float32,device=self.device), p=2, dim=1)
-        available={"Random": lambda: RandomPolicy(), "MIRT-MFI": lambda: HeuristicMIRTPolicy("MIRT-MFI"), "MIRT-KLI": lambda: HeuristicMIRTPolicy("MIRT-KLI"), "OneStepOracle": lambda: OneStepOraclePolicy()}
+        available={"Random": lambda: RandomPolicy(), "Random-MIRT": lambda: RandomMIRTPolicy(), "MIRT-MFI": lambda: HeuristicMIRTPolicy("MIRT-MFI"), "MIRT-KLI": lambda: HeuristicMIRTPolicy("MIRT-KLI"), "OneStepOracle": lambda: OneStepOraclePolicy()}
         mcfg=dict((self.config.get("benchmark") or {}).get("mirt") or {})
         real_mirt={"MIRT-Trace-MFI","MIRT-D-opt","MIRT-MKLI","MIRT-Local-KLI"}
         theta_cfg={"steps":int(mcfg.get("theta_steps",30)),"lr":float(mcfg.get("theta_lr",0.05)),"theta_l2":float(mcfg.get("theta_l2",0.01)),"grad_clip":float(mcfg.get("theta_grad_clip",5.0)),"early_stop_tol":float(mcfg.get("early_stop_tol",1e-5))}
         policies=[]
         for name in self.policy_names:
-            if name == "DDPG":
+            if name == "DDPG-MIRT":
+                if mirt is None:
+                    if not (self.debug or synthetic):
+                        raise MissingAssetsError([Path(str((self.config.get("assets") or {}).get("mirt_checkpoint","mirt_checkpoint")))])
+                    mirt = MIRTModel(3, q.shape[0], min(36, q.shape[1])).to(self.device).eval()
+                policies.append(DDPGMIRTPolicy(self.ddpg_mirt_checkpoint, mirt, theta_cfg=theta_cfg, device=self.device))
+            elif name == "DDPG":
                 actor=None
                 if self.ddpg_checkpoint.exists():
                     actor=LSTMActor(semantic_dim=item_bank.shape[1], q_dim=q.shape[1]).to(self.device); actor.load_state_dict(torch.load(self.ddpg_checkpoint,map_location=self.device)); actor.eval()
@@ -110,6 +120,13 @@ class BenchmarkV2Evaluator:
             else:
                 raise ValueError(f"Unknown benchmark policy: {name}")
         return policies
+
+    def _predict_mirt(self, mirt, hist_i, hist_r, target_i):
+        if not target_i: return []
+        theta = fit_mirt_theta(mirt, hist_i, hist_r, steps=(2 if self.debug else 8), device=self.device)
+        with torch.no_grad():
+            out = mirt_predict_with_theta(mirt, theta, target_i)
+        return [float(x) for x in out.detach().cpu().tolist()]
 
     def run(self):
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -139,11 +156,11 @@ class BenchmarkV2Evaluator:
                     hist_i=[sp.warm_start_item]; hist_r=[sp.warm_start_response]; selected=[]; selected_r=[]
                     max_extra=max(self.steps)
                     checkpoints=set(self.steps)
-                    def predict_history(hi, hr, targets): return self._predict(ncdm, q_tensor, hi, hr, list(targets))
-                    def query_nll_after(hi, hr): return nll_score(sp.query_responses, self._predict(ncdm, q_tensor, hi, hr, sp.query_item_ids))
+                    def predict_history(hi, hr, targets): return (self._predict_mirt(mirt, hi, hr, list(targets)) if self.track == "mirt_native" else self._predict(ncdm, q_tensor, hi, hr, list(targets)))
+                    def query_nll_after(hi, hr): return nll_score(sp.query_responses, predict_history(hi, hr, sp.query_item_ids))
                     for t in range(0, max_extra+1):
                         if t in checkpoints:
-                            scores=self._predict(ncdm, q_tensor, hist_i, hist_r, sp.query_item_ids)
+                            scores=(self._predict_mirt(mirt, hist_i, hist_r, sp.query_item_ids) if self.track == "mirt_native" else self._predict(ncdm, q_tensor, hist_i, hist_r, sp.query_item_ids))
                             if scores:
                                 step_pred[t][0].extend(sp.query_responses); step_pred[t][1].extend(scores); q_inter[t]+=len(sp.query_item_ids)
                                 mb=metric_bundle(sp.query_responses, scores); step_stu[t].append(mb)
@@ -185,7 +202,7 @@ class BenchmarkV2Evaluator:
                 for tr in traces: f.write(json.dumps(tr)+"\n")
         (self.output_dir/"policy_metadata.json").write_text(json.dumps(metadata,indent=2))
         run_config=dict(self.config)
-        run_config["benchmark"]={**dict(run_config.get("benchmark") or {}), "protocol":"benchmark_v2", "seeds":self.seeds, "max_students":self.max_students, "steps":self.steps, "output_dir":str(self.output_dir), "candidate_size":self.candidate_size, "ddpg_checkpoint":str(self.ddpg_checkpoint), "policies":self.policy_names, "device":str(self.device), "synthetic":bool(synthetic), "debug":bool(self.debug)}
+        run_config["benchmark"]={**dict(run_config.get("benchmark") or {}), "protocol":"benchmark_v2", "seeds":self.seeds, "max_students":self.max_students, "steps":self.steps, "output_dir":str(self.output_dir), "candidate_size":self.candidate_size, "ddpg_checkpoint":str(self.ddpg_checkpoint), "ddpg_mirt_checkpoint":str(self.ddpg_mirt_checkpoint), "track":self.track, "policies":self.policy_names, "device":str(self.device), "synthetic":bool(synthetic), "debug":bool(self.debug)}
         run_config["device"] = str(self.device)
         (self.output_dir/"run_config.yaml").write_text(yaml.safe_dump(run_config))
         return all_rows
