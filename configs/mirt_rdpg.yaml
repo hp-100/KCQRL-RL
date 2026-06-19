@@ -1,0 +1,34 @@
+device: cpu
+assets:
+  mirt_checkpoint: metadata/mirt_model_36d.pt
+  train_valid_sequences: kc_level/train_valid_sequences.csv
+model:
+  state_dim: 75
+  hidden_dim: 128
+  action_dim: 37
+theta_fit:
+  steps: 30
+  lr: 0.05
+  theta_l2: 0.01
+  grad_clip: 5.0
+sequence_replay:
+  capacity_episodes: 5000
+  burn_in_length: 3
+  unroll_length: 5
+  batch_sequences: 8
+  min_episodes_before_update: 8
+training:
+  output_dir: outputs/mirt_rdpg
+  seed: 42
+  epochs: 2
+  max_steps: 10
+  updates_per_episode: 1
+  actor_lr: 3.0e-5
+  critic_lr: 1.0e-5
+  gamma: 0.99
+  tau: 0.005
+  policy_delay: 2
+  gradient_clip: 1.0
+  q_clip: 20.0
+  reward_scale: 10.0
+  reward_clip: 5.0

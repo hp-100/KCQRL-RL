@@ -5,3 +5,5 @@ from .ddpg_policy import DDPGPolicy
 from .oracle_policy import OneStepOraclePolicy
 
 from .ddpg_mirt_policy import DDPGMIRTPolicy
+
+from .rdpg_mirt_policy import RDPGMIRTPolicy
