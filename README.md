@@ -61,3 +61,50 @@ If Google Drive assets are unavailable, the scripts print the missing configured
 * `OneStepOracle`
 
 For DDPG, evaluation loads the trained LSTM actor checkpoint passed via `--ddpg-checkpoint`, builds candidate vectors from the same representation used during training (`q_matrix + NCDM difficulty + NCDM discrimination`), and selects the nearest candidate item to the actor's ideal action vector.
+
+## Evaluation protocols
+
+KCQRL-RL now keeps two offline evaluation paths:
+
+* **Legacy evaluation** (`python evaluate.py --config configs/default.yaml --debug`) preserves the original CAT/RL replay behavior for backward compatibility. It is useful for sanity checks, but it is **not recommended for paper results** because each policy may be scored on different selected items.
+* **`benchmark_v2` paper evaluation** uses a paired, deterministic support/query protocol. For every seed and student, item IDs are first filtered to the shared asset bounds, then a deterministic `student_id + seed` split creates an 80% support/candidate pool and a 20% fixed query set (minimum five query items). All policies receive the same warm-start item, same candidate pool, same query items, and same checkpoints (`0,1,3,5,10,20`). Query responses are hidden from deployable policies and used only for metric computation; `OneStepOracle` is explicitly marked as a privileged-information upper bound.
+
+### Running benchmark_v2
+
+Single-seed debug run:
+
+```bash
+python evaluate.py \
+  --config configs/default.yaml \
+  --protocol benchmark_v2 \
+  --debug \
+  --ddpg-checkpoint outputs/ddpg_actor_final.pt \
+  --seeds 42 \
+  --max-students 20 \
+  --steps 0,1,3,5 \
+  --output-dir results/benchmark_v2
+```
+
+Multi-seed paper run:
+
+```bash
+python evaluate.py \
+  --config configs/default.yaml \
+  --protocol benchmark_v2 \
+  --ddpg-checkpoint outputs/ddpg_actor_final.pt \
+  --seeds 42,43,44,45,46 \
+  --max-students 300 \
+  --steps 0,1,3,5,10,20 \
+  --output-dir results/benchmark_v2
+```
+
+Colab example after mounting Google Drive:
+
+```python
+from google.colab import drive
+drive.mount('/content/drive')
+!python evaluate.py --config configs/default.yaml --protocol benchmark_v2 \
+  --ddpg-checkpoint outputs/ddpg_actor_final.pt --seeds 42 --max-students 300
+```
+
+`benchmark_v2` writes `aggregate.csv`, `per_seed.csv`, `per_student.csv`, `predictions.csv`, `traces.jsonl`, `run_config.yaml`, `policy_metadata.json`, and `splits_seed*.json` under the configured output directory. Current `MIRT-MFI` and `MIRT-KLI` adapters are metadata-tagged as `implementation: heuristic`; they are simplified proxies, not formal MIRT implementations.

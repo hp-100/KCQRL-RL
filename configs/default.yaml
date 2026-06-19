@@ -36,3 +36,18 @@ training:
   output_dir: outputs
   best_checkpoint_path: outputs/ddpg_actor_best.pt
   final_checkpoint_path: outputs/ddpg_actor_final.pt
+
+benchmark:
+  protocol: legacy
+  evaluator_model: ncdm
+  query_ratio: 0.2
+  min_query_items: 5
+  warm_start_items: 1
+  steps: [0, 1, 3, 5, 10, 20]
+  seeds: [42]
+  max_students: 300
+  candidate_size: null
+  save_split_manifest: true
+  save_predictions: true
+  save_traces: true
+  output_dir: results/benchmark_v2
