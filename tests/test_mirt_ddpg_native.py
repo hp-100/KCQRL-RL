@@ -56,13 +56,13 @@ def test_ddpg_mirt_checkpoint_requires_action_stats(tmp_path):
         DDPGMIRTPolicy(ck, make_mirt())
 
 
-def test_ddpg_mirt_checkpoint_uses_checkpoint_theta_cfg(tmp_path):
+def test_ddpg_mirt_checkpoint_rejects_theta_mismatch(tmp_path):
     ck=tmp_path/'ok.pt'
     actor=MIRTActor()
     theta_fit={'steps':7,'lr':0.2,'theta_l2':0.03,'grad_clip':1.5,'early_stop_tol':0.0}
-    torch.save({'actor_state_dict':actor.state_dict(),'action_mean':torch.zeros(37),'action_std':torch.ones(37),'hidden_dim':128,'actor_architecture':ACTOR_ARCHITECTURE,'theta_fit':theta_fit}, ck)
-    pol=DDPGMIRTPolicy(ck, make_mirt(), theta_cfg={'steps':1})
-    assert pol.theta_cfg == theta_fit
+    torch.save({'actor_state_dict':actor.state_dict(),'action_mean':torch.zeros(37),'action_std':torch.ones(37),'hidden_dim':128,'actor_architecture':ACTOR_ARCHITECTURE,'theta_fit':theta_fit,'selection_horizon':3,'warm_start_items':1}, ck)
+    with pytest.raises(ValueError, match='theta_fit mismatch'):
+        DDPGMIRTPolicy(ck, make_mirt(), theta_cfg={'steps':1})
 
 
 def test_trainer_scalar_logging_detaches_before_item():

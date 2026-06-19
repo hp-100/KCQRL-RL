@@ -11,6 +11,7 @@ theta_fit:
   lr: 0.05
   theta_l2: 0.01
   grad_clip: 5.0
+  early_stop_tol: 1.0e-5
 training:
   output_dir: outputs/mirt_ddpg
   seed: 42

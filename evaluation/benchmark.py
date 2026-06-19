@@ -12,7 +12,7 @@ import yaml
 
 from evaluation.offline_eval import CATOfflineEvaluator, MissingAssetsError, StudentSequence
 from evaluation.metrics import metric_bundle, nanmean, gini, nll_score
-from evaluation.protocol import StudentSplit, make_student_split, save_manifest, valid_item_count
+from evaluation.protocol import StudentSplit, make_student_split, save_manifest, valid_item_count, selection_horizon_from_config
 from evaluation.policies import RandomPolicy, HeuristicMIRTPolicy, FormalMIRTPolicy, DDPGPolicy, OneStepOraclePolicy, DDPGMIRTPolicy, RandomMIRTPolicy, RDPGMIRTPolicy
 from models.ncdm import OfficialNCDM, fit_student_alpha, safe_load_ncdm_checkpoint
 from models.mirt import MIRTModel, load_mirt_checkpoint, fit_student_theta as fit_mirt_theta, predict_with_theta as mirt_predict_with_theta
@@ -29,6 +29,7 @@ class BenchmarkV2Evaluator:
         self.max_students = int(max_students if max_students is not None else b.get("max_students", 20 if debug else 300))
         self.query_ratio = float(b.get("query_ratio", 0.2)); self.min_query_items = int(b.get("min_query_items", 5))
         self.candidate_size = b.get("candidate_size", None)
+        self.selection_horizon = selection_horizon_from_config(self.config, default=(max(self.steps) if self.steps else None))
         configured_policies = b.get("policies", ["Random", "MIRT-MFI", "MIRT-KLI", "DDPG", "OneStepOracle"])
         self.policy_names = [str(x) for x in (policies if policies is not None else configured_policies)]
         self.save_predictions = bool(b.get("save_predictions", True)); self.save_traces = bool(b.get("save_traces", True))
@@ -193,7 +194,7 @@ class BenchmarkV2Evaluator:
                             student_rows.append({"seed":seed,"policy":pol.name,"student_id":sp.student_id,"step":t,**{k:v for k,v in mb.items()}})
                         if t == max_extra or not cand: break
                         avail=cand if self.candidate_size is None else cand[:int(self.candidate_size)]
-                        ctx={"query_item_ids":sp.query_item_ids,"predict_history":predict_history,"candidate_response_lookup":cresp,"query_nll_after_history":query_nll_after}
+                        ctx={"query_item_ids":sp.query_item_ids,"predict_history":predict_history,"candidate_response_lookup":cresp,"query_nll_after_history":query_nll_after,"policy_step":t,"selection_horizon":self.selection_horizon}
                         item=pol.select(avail, hist_i, hist_r, ctx)
                         if item not in avail: raise RuntimeError(f"{pol.name} selected item outside candidate pool")
                         cand.remove(item); resp=cresp[item]; hist_i.append(item); hist_r.append(resp); selected.append(item); selected_r.append(resp); exposures[t+1][item]+=1
@@ -225,7 +226,7 @@ class BenchmarkV2Evaluator:
                 for tr in traces: f.write(json.dumps(tr)+"\n")
         (self.output_dir/"policy_metadata.json").write_text(json.dumps(metadata,indent=2))
         run_config=dict(self.config)
-        run_config["benchmark"]={**dict(run_config.get("benchmark") or {}), "protocol":"benchmark_v2", "seeds":self.seeds, "max_students":self.max_students, "steps":self.steps, "output_dir":str(self.output_dir), "candidate_size":self.candidate_size, "ddpg_checkpoint":str(self.ddpg_checkpoint), "ddpg_mirt_checkpoint":str(self.ddpg_mirt_checkpoint), "track":self.track, "policies":self.policy_names, "device":str(self.device), "synthetic":bool(synthetic), "debug":bool(self.debug)}
+        run_config["benchmark"]={**dict(run_config.get("benchmark") or {}), "protocol":"benchmark_v2", "seeds":self.seeds, "max_students":self.max_students, "steps":self.steps, "output_dir":str(self.output_dir), "candidate_size":self.candidate_size, "ddpg_checkpoint":str(self.ddpg_checkpoint), "ddpg_mirt_checkpoint":str(self.ddpg_mirt_checkpoint), "rdpg_mirt_checkpoint":str(self.rdpg_mirt_checkpoint), "selection_horizon":self.selection_horizon, "track":self.track, "policies":self.policy_names, "device":str(self.device), "synthetic":bool(synthetic), "debug":bool(self.debug)}
         run_config["device"] = str(self.device)
         (self.output_dir/"run_config.yaml").write_text(yaml.safe_dump(run_config))
         return all_rows
