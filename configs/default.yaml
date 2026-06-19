@@ -57,3 +57,12 @@ benchmark:
   save_predictions: true
   save_traces: true
   output_dir: results/benchmark_v2
+  mirt:
+    theta_steps: 30
+    theta_lr: 0.05
+    theta_l2: 0.01
+    theta_grad_clip: 5.0
+    early_stop_tol: 1.0e-5
+    d_opt_ridge: 0.01
+    mkli_samples: 16
+    mkli_scale: 0.25

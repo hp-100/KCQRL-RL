@@ -7,6 +7,9 @@ class PolicyMetadata:
     name: str
     implementation: str = "reference"
     uses_privileged_information: bool = False
+    selection_model: str = ""
+    evaluator_model: str = ""
+    uses_query_labels: bool = False
     notes: str = ""
 
 class BaseCATPolicy:
