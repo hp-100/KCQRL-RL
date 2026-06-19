@@ -77,6 +77,7 @@ Single-seed debug run:
 python evaluate.py \
   --config configs/default.yaml \
   --protocol benchmark_v2 \
+  --policies Random,MIRT-Trace-MFI,MIRT-D-opt,MIRT-MKLI,DDPG \
   --debug \
   --ddpg-checkpoint outputs/ddpg_actor_final.pt \
   --seeds 42 \
@@ -108,3 +109,10 @@ drive.mount('/content/drive')
 ```
 
 `benchmark_v2` writes `aggregate.csv`, `per_seed.csv`, `per_student.csv`, `predictions.csv`, `traces.jsonl`, `run_config.yaml`, `policy_metadata.json`, and `splits_seed*.json` under the configured output directory. Current `MIRT-MFI` and `MIRT-KLI` adapters are metadata-tagged as `implementation: heuristic`; they are simplified proxies, not formal MIRT implementations.
+
+
+### Benchmark v2 MIRT selector comparison
+
+`benchmark_v2` reports **selector-level** comparisons by default: Random, heuristic selectors, formal MIRT selectors, and DDPG may use different item-selection models, but query-set evaluation is kept on the same frozen NCDM predictor. This isolates the value of the selector while avoiding end-to-end model/evaluator changes. In contrast, an **end-to-end** comparison would evaluate each selector with its own response model (for example, MIRT-selected histories evaluated by MIRT), which answers a different question and is not directly comparable to the DDPG selector-level benchmark.
+
+Formal MIRT selectors (`MIRT-Trace-MFI`, `MIRT-D-opt`, `MIRT-MKLI`) load `assets.mirt_checkpoint`, infer the checkpoint dimensions dynamically, freeze item parameters, and refit an independent test-student theta from support history before every selection. Legacy `MIRT-MFI` and `MIRT-KLI` remain heuristic proxy baselines and are marked as such in policy metadata.

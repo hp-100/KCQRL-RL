@@ -13,8 +13,9 @@ import yaml
 from evaluation.offline_eval import CATOfflineEvaluator, MissingAssetsError, StudentSequence
 from evaluation.metrics import metric_bundle, nanmean, gini, nll_score
 from evaluation.protocol import StudentSplit, make_student_split, save_manifest, valid_item_count
-from evaluation.policies import RandomPolicy, HeuristicMIRTPolicy, DDPGPolicy, OneStepOraclePolicy
+from evaluation.policies import RandomPolicy, HeuristicMIRTPolicy, FormalMIRTPolicy, DDPGPolicy, OneStepOraclePolicy
 from models.ncdm import OfficialNCDM, fit_student_alpha, safe_load_ncdm_checkpoint
+from models.mirt import MIRTModel, load_mirt_checkpoint
 from models.actor import LSTMActor
 
 
@@ -55,6 +56,9 @@ class BenchmarkV2Evaluator:
                     diff=torch.sigmoid(self.k_difficulty(exer_id)); disc=torch.sigmoid(self.e_discrimination(exer_id))*3.0
                     return torch.sigmoid((disc*(torch.sigmoid(alpha)-diff)*q_matrix[exer_id]).sum(dim=-1))
             ncdm = TinyNCDM(len(q), q.shape[1]).to(self.device).eval()
+
+            mirt = MIRTModel(3, len(q), min(36, q.shape[1] if hasattr(q, "shape") else 6)).to(self.device).eval()
+            self.mirt_model = mirt
             return q, item_bank, seqs[:self.max_students], ncdm, True
         legacy.ensure_assets()
         q = legacy._load_array(legacy.paths["q_matrix"]).astype(np.float32)
@@ -63,6 +67,12 @@ class BenchmarkV2Evaluator:
         ncdm = OfficialNCDM(1, q.shape[0], q.shape[1]).to(self.device)
         safe_load_ncdm_checkpoint(ncdm, legacy.paths["ncdm_checkpoint"], self.device)
         ncdm.eval()
+
+        mirt = None
+        mirt_path = legacy.paths.get("mirt_checkpoint")
+        if mirt_path and mirt_path.exists():
+            mirt = load_mirt_checkpoint(mirt_path, self.device)
+        self.mirt_model = mirt
         return q, item_bank, seqs[:self.max_students], ncdm, False
 
     def _predict(self, ncdm, q_tensor, hist_i, hist_r, target_i):
@@ -73,10 +83,15 @@ class BenchmarkV2Evaluator:
             out = ncdm.predict_with_alpha(alpha, torch.tensor(target_i, dtype=torch.long, device=self.device), q_tensor)
         return [float(x) for x in out.detach().cpu().tolist()]
 
-    def _policies(self, q, item_bank, ncdm, synthetic):
+    def _policies(self, q, item_bank, ncdm, synthetic, mirt=None):
+        if mirt is None:
+            mirt = getattr(self, "mirt_model", None)
         q_t=torch.tensor(q,dtype=torch.float32,device=self.device)
         ib_t=torch.nn.functional.normalize(torch.tensor(item_bank,dtype=torch.float32,device=self.device), p=2, dim=1)
         available={"Random": lambda: RandomPolicy(), "MIRT-MFI": lambda: HeuristicMIRTPolicy("MIRT-MFI"), "MIRT-KLI": lambda: HeuristicMIRTPolicy("MIRT-KLI"), "OneStepOracle": lambda: OneStepOraclePolicy()}
+        mcfg=dict((self.config.get("benchmark") or {}).get("mirt") or {})
+        real_mirt={"MIRT-Trace-MFI","MIRT-D-opt","MIRT-MKLI","MIRT-Local-KLI"}
+        theta_cfg={"steps":int(mcfg.get("theta_steps",30)),"lr":float(mcfg.get("theta_lr",0.05)),"theta_l2":float(mcfg.get("theta_l2",0.01)),"grad_clip":float(mcfg.get("theta_grad_clip",5.0)),"early_stop_tol":float(mcfg.get("early_stop_tol",1e-5))}
         policies=[]
         for name in self.policy_names:
             if name == "DDPG":
@@ -84,6 +99,12 @@ class BenchmarkV2Evaluator:
                 if self.ddpg_checkpoint.exists():
                     actor=LSTMActor(semantic_dim=item_bank.shape[1], q_dim=q.shape[1]).to(self.device); actor.load_state_dict(torch.load(self.ddpg_checkpoint,map_location=self.device)); actor.eval()
                 policies.append(DDPGPolicy(self.ddpg_checkpoint, actor=actor, q_matrix=q_t, item_bank=ib_t, ncdm=ncdm, device=self.device, allow_debug_fallback=self.debug or synthetic))
+            elif name in real_mirt:
+                if mirt is None:
+                    if not (self.debug or synthetic):
+                        raise MissingAssetsError([Path(str((self.config.get("assets") or {}).get("mirt_checkpoint","mirt_checkpoint")))])
+                    mirt = MIRTModel(3, q.shape[0], min(36, q.shape[1])).to(self.device).eval()
+                policies.append(FormalMIRTPolicy(name, mirt, theta_cfg=theta_cfg, d_opt_ridge=mcfg.get("d_opt_ridge",0.01), mkli_samples=mcfg.get("mkli_samples",16), mkli_scale=mcfg.get("mkli_scale",0.25), device=self.device))
             elif name in available:
                 policies.append(available[name]())
             else:
@@ -93,8 +114,11 @@ class BenchmarkV2Evaluator:
     def run(self):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         q, item_bank, seqs, ncdm, synthetic = self._load_or_synthetic()
+        mirt = getattr(self, "mirt_model", None)
         q_tensor=torch.tensor(q,dtype=torch.float32,device=self.device)
-        vcount=valid_item_count(q, item_bank, ncdm)
+        vcount=valid_item_count(q, item_bank, ncdm, mirt)
+        counts_msg={"q_matrix":len(q),"item_bank":len(item_bank),"ncdm_items":int(ncdm.k_difficulty.num_embeddings),"mirt_items":int(mirt.n_items) if mirt is not None else None,"valid_item_count":int(vcount)}
+        print(f"benchmark_v2 valid_item_count: {counts_msg}")
         all_rows=[]; pred_rows=[]; student_rows=[]; traces=[]; metadata={}
         for seed in self.seeds:
             splits=[]; skipped={}
@@ -103,7 +127,7 @@ class BenchmarkV2Evaluator:
                 if sp: splits.append(sp)
                 else: skipped[seq.student_id]=reason or "invalid"
             save_manifest(self.output_dir/f"splits_seed{seed}.json", splits, skipped, {"seed":seed,"query_ratio":self.query_ratio,"min_query_items":self.min_query_items})
-            policies=self._policies(q, item_bank, ncdm, synthetic)
+            policies=self._policies(q, item_bank, ncdm, synthetic, mirt=mirt)
             expected_evaluated_by_step={}
             for pol in policies: metadata[pol.name]=pol.metadata.__dict__
             for pol in policies:

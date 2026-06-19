@@ -27,10 +27,12 @@ class StudentSplit:
         return asdict(self)
 
 
-def valid_item_count(q_matrix, item_bank, ncdm=None) -> int:
+def valid_item_count(q_matrix, item_bank, ncdm=None, mirt=None) -> int:
     counts = [len(q_matrix), len(item_bank)]
     if ncdm is not None:
         counts.extend([ncdm.k_difficulty.num_embeddings, ncdm.e_discrimination.num_embeddings])
+    if mirt is not None:
+        counts.extend([mirt.disc_emb.num_embeddings, mirt.diff_emb.num_embeddings])
     return min(int(c) for c in counts)
 
 
