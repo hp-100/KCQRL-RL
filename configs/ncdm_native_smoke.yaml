@@ -1,0 +1,15 @@
+track: ncdm_native
+policies:
+  - Random-NCDM
+  - C3DQN-NCDM
+selection_horizon: 5
+warm_start_items: 1
+requires:
+  - q_matrix
+  - ncdm_checkpoint
+  - test_sequences
+candidate_pool:
+  max_candidates: null
+  prefilter_enabled: false
+  prefilter_top_k: 256
+  prefilter_mode: diagnostic_heuristic
