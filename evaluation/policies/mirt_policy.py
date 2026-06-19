@@ -9,7 +9,11 @@ class HeuristicMIRTPolicy(BaseCATPolicy):
         self.name = name
         self.metadata = PolicyMetadata(name=name, implementation="heuristic", notes="Simplified proxy, not a formal MIRT implementation.")
     def select(self, candidate_item_ids, history_item_ids, history_responses, context):
-        preds = context["predict_history"](history_item_ids, history_responses, candidate_item_ids)
+        predict_history = context.get("predict_history")
+        if predict_history is None:
+            preds = [0.5 for _ in candidate_item_ids]
+        else:
+            preds = predict_history(history_item_ids, history_responses, candidate_item_ids)
         if self.name == "MIRT-MFI":
             idx = int(np.argmax([p * (1 - p) for p in preds]))
         else:

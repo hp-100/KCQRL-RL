@@ -194,7 +194,9 @@ class BenchmarkV2Evaluator:
                             student_rows.append({"seed":seed,"policy":pol.name,"student_id":sp.student_id,"step":t,**{k:v for k,v in mb.items()}})
                         if t == max_extra or not cand: break
                         avail=cand if self.candidate_size is None else cand[:int(self.candidate_size)]
-                        ctx={"query_item_ids":sp.query_item_ids,"predict_history":predict_history,"candidate_response_lookup":cresp,"query_nll_after_history":query_nll_after,"policy_step":t,"selection_horizon":self.selection_horizon}
+                        ctx={"policy_step":t,"selection_horizon":self.selection_horizon}
+                        if bool(getattr(pol.metadata, "uses_privileged_information", False)):
+                            ctx={**ctx,"query_item_ids":sp.query_item_ids,"predict_history":predict_history,"candidate_response_lookup":cresp,"query_nll_after_history":query_nll_after}
                         item=pol.select(avail, hist_i, hist_r, ctx)
                         if item not in avail: raise RuntimeError(f"{pol.name} selected item outside candidate pool")
                         cand.remove(item); resp=cresp[item]; hist_i.append(item); hist_r.append(resp); selected.append(item); selected_r.append(resp); exposures[t+1][item]+=1
