@@ -11,12 +11,12 @@ def soft_update(source: torch.nn.Module, target: torch.nn.Module, tau: float) ->
 
 
 class DDPGAgent:
-    def __init__(self, q_dim=36, semantic_dim=128, hidden_dim=128, actor_lr=1e-4, critic_lr=1e-4, device="cpu"):
+    def __init__(self, q_dim=36, semantic_dim=128, hidden_dim=128, actor_lr=3e-5, critic_lr=1e-5, q_clip=20.0, device="cpu"):
         self.device = torch.device(device)
         self.actor = LSTMActor(semantic_dim, q_dim, hidden_dim=hidden_dim).to(self.device)
-        self.critic = LSTMCritic(hidden_dim, self.actor.action_dim).to(self.device)
+        self.critic = LSTMCritic(hidden_dim, self.actor.action_dim, q_clip=q_clip).to(self.device)
         self.target_actor = LSTMActor(semantic_dim, q_dim, hidden_dim=hidden_dim).to(self.device)
-        self.target_critic = LSTMCritic(hidden_dim, self.actor.action_dim).to(self.device)
+        self.target_critic = LSTMCritic(hidden_dim, self.actor.action_dim, q_clip=q_clip).to(self.device)
         self.target_actor.load_state_dict(self.actor.state_dict())
         self.target_critic.load_state_dict(self.critic.state_dict())
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)

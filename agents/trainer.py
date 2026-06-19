@@ -23,8 +23,15 @@ class DDPGTrainer:
         tc = config.get("training", {}) or {}
         self.episodes = int(tc.get("episodes", 5)); self.batch_size = int(tc.get("batch_size", 64))
         self.gamma = float(tc.get("gamma", 0.99)); self.tau = float(tc.get("tau", 0.005))
+        self.actor_lr = float(tc.get("actor_lr", 3e-5)); self.critic_lr = float(tc.get("critic_lr", 1e-5))
+        self.reward_scale = float(tc.get("reward_scale", 10.0)); self.q_clip = float(tc.get("q_clip", 20.0))
+        self.policy_delay = max(1, int(tc.get("policy_delay", 2))); self.gradient_clip = float(tc.get("gradient_clip", 1.0))
+        self.best_checkpoint_path = Path(tc.get("best_checkpoint_path", "outputs/ddpg_actor_best.pt"))
+        self.final_checkpoint_path = Path(tc.get("final_checkpoint_path", "outputs/ddpg_actor_final.pt"))
         self.horizon = int(tc.get("horizon", 10)); self.max_students = int(tc.get("max_students", 300))
         self.output_dir = Path(tc.get("output_dir", "outputs")); self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.best_checkpoint_path.parent.mkdir(parents=True, exist_ok=True); self.final_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        self.update_step = 0
         self.buffer = ReplayBuffer(int(tc.get("replay_capacity", 20000)), self.seed)
 
     @staticmethod
@@ -47,7 +54,7 @@ class DDPGTrainer:
         safe_load_ncdm_checkpoint(ncdm, self.paths["ncdm_checkpoint"], self.device)
         ncdm.eval()
         for p in ncdm.parameters(): p.requires_grad = False
-        agent = DDPGAgent(q_dim=q_matrix.shape[1], semantic_dim=item_bank.shape[1], device=self.device)
+        agent = DDPGAgent(q_dim=q_matrix.shape[1], semantic_dim=item_bank.shape[1], actor_lr=self.actor_lr, critic_lr=self.critic_lr, q_clip=self.q_clip, device=self.device)
         return q_matrix, item_bank, max_item, df.sample(n=min(self.max_students, len(df)), random_state=self.seed), q_col, r_col, ncdm, agent
 
     def select_candidate(self, ideal, avail_i, q_matrix, ncdm):
@@ -66,19 +73,26 @@ class DDPGTrainer:
         ideal, h1, c1 = agent.actor(sem, q, diff, disc, resp, h0, c0)
         with torch.no_grad():
             nideal, nh, _ = agent.target_actor(nsem, nq, ndiff, ndisc, nresp, h1.detach(), c1.detach())
-            target_q = rew + self.gamma * agent.target_critic(nh, nideal) * (1.0 - done)
-        critic_loss = nn.SmoothL1Loss()(agent.critic(h1.detach(), act), target_q)
-        agent.critic_optimizer.zero_grad(); critic_loss.backward(); torch.nn.utils.clip_grad_norm_(agent.critic.parameters(), 1.0); agent.critic_optimizer.step()
-        actor_loss = -agent.critic(h1, ideal).mean()
-        agent.actor_optimizer.zero_grad(); actor_loss.backward(); torch.nn.utils.clip_grad_norm_(agent.actor.parameters(), 1.0); agent.actor_optimizer.step()
-        soft_update(agent.actor, agent.target_actor, self.tau); soft_update(agent.critic, agent.target_critic, self.tau)
-        return float(actor_loss.item()), float(critic_loss.item())
+            target_q = torch.clamp(rew + self.gamma * agent.target_critic(nh, nideal) * (1.0 - done), -self.q_clip, self.q_clip)
+        current_q = agent.critic(h1.detach(), act)
+        critic_loss = nn.SmoothL1Loss()(current_q, target_q)
+        agent.critic_optimizer.zero_grad(); critic_loss.backward(); torch.nn.utils.clip_grad_norm_(agent.critic.parameters(), self.gradient_clip); agent.critic_optimizer.step()
+        self.update_step += 1
+        actor_loss_value = None
+        if self.update_step % self.policy_delay == 0:
+            actor_loss = -agent.critic(h1, ideal).mean()
+            agent.actor_optimizer.zero_grad(); actor_loss.backward(); torch.nn.utils.clip_grad_norm_(agent.actor.parameters(), self.gradient_clip); agent.actor_optimizer.step()
+            soft_update(agent.actor, agent.target_actor, self.tau)
+            actor_loss_value = float(actor_loss.item())
+        soft_update(agent.critic, agent.target_critic, self.tau)
+        return actor_loss_value, float(critic_loss.item()), float(current_q.mean().item()), float(target_q.mean().item())
 
     def train(self):
         q_matrix, item_bank, max_item, rows, q_col, r_col, ncdm, agent = self._load()
         logs = []
+        best_reward = -float("inf")
         for epoch in range(self.episodes):
-            rewards=[]; aloss=[]; closs=[]; noise_std=max(0.05, 0.5 - epoch * 0.05)
+            rewards=[]; aloss=[]; closs=[]; mean_q=[]; mean_target_q=[]; noise_std=max(0.05, 0.5 - epoch * 0.05)
             for _, row in tqdm(rows.iterrows(), total=len(rows), desc=f"DDPG epoch {epoch+1}/{self.episodes}"):
                 items, responses = clean_sequence(row[q_col], row[r_col], max_item)
                 if len(items) < 4: continue
@@ -96,15 +110,20 @@ class DDPGTrainer:
                         noisy=torch.clamp(ideal + torch.randn_like(ideal)*noise_std,0,1)
                     loc=self.select_candidate(noisy,avail_i,q_matrix,ncdm); next_i=avail_i.pop(loc); next_r=avail_r.pop(loc)
                     hist_i.append(next_i); hist_r.append(next_r)
-                    curr_ent=self._entropy(ncdm,q_matrix,hist_i,hist_r,val_i); reward=information_gain_reward(prev_ent,curr_ent); rewards.append(reward)
+                    curr_ent=self._entropy(ncdm,q_matrix,hist_i,hist_r,val_i); reward=information_gain_reward(prev_ent,curr_ent,scale=self.reward_scale); rewards.append(reward)
                     nt=torch.tensor([next_i],device=self.device); ndiff=torch.sigmoid(ncdm.k_difficulty(nt)).squeeze(0); ndisc=torch.sigmoid(ncdm.e_discrimination(nt)).squeeze(0)
                     done=float(step == self.horizon-1 or not avail_i)
                     self.buffer.push(hx.squeeze(0).detach().cpu().numpy(), cx.squeeze(0).detach().cpu().numpy(), sem.cpu().numpy(), q.cpu().numpy(), diff.cpu().numpy(), disc.cpu().numpy(), cur_r, noisy.squeeze(0).cpu().numpy(), reward, item_bank[next_i].cpu().numpy(), q_matrix[next_i].cpu().numpy(), ndiff.cpu().numpy(), ndisc.cpu().numpy(), next_r, done)
                     hx,cx=nh.detach(),nc.detach(); cur_i,cur_r=next_i,next_r
                     metrics=self.optimize(agent)
-                    if metrics: aloss.append(metrics[0]); closs.append(metrics[1])
+                    if metrics:
+                        if metrics[0] is not None: aloss.append(metrics[0])
+                        closs.append(metrics[1]); mean_q.append(metrics[2]); mean_target_q.append(metrics[3])
                     if done: break
-            log={"epoch":epoch+1,"reward":float(np.mean(rewards)) if rewards else 0.0,"actor_loss":float(np.mean(aloss)) if aloss else 0.0,"critic_loss":float(np.mean(closs)) if closs else 0.0}
-            logs.append(log); print(f"Epoch {log['epoch']} reward={log['reward']:.4f} actor_loss={log['actor_loss']:.4f} critic_loss={log['critic_loss']:.4f}")
-        out=self.output_dir/"ddpg_actor.pt"; torch.save(agent.actor.state_dict(), out)
-        return logs, out
+            log={"epoch":epoch+1,"reward":float(np.mean(rewards)) if rewards else 0.0,"actor_loss":float(np.mean(aloss)) if aloss else 0.0,"critic_loss":float(np.mean(closs)) if closs else 0.0,"mean_q":float(np.mean(mean_q)) if mean_q else 0.0,"mean_target_q":float(np.mean(mean_target_q)) if mean_target_q else 0.0,"replay_buffer_size":len(self.buffer),"noise_std":noise_std}
+            logs.append(log)
+            if log["reward"] >= best_reward:
+                best_reward = log["reward"]; torch.save(agent.actor.state_dict(), self.best_checkpoint_path)
+            print(f"Epoch {log['epoch']} reward={log['reward']:.4f} actor_loss={log['actor_loss']:.4f} critic_loss={log['critic_loss']:.4f} mean_q={log['mean_q']:.4f} mean_target_q={log['mean_target_q']:.4f} replay_buffer_size={log['replay_buffer_size']} noise_std={log['noise_std']:.4f}")
+        torch.save(agent.actor.state_dict(), self.final_checkpoint_path)
+        return logs, self.final_checkpoint_path

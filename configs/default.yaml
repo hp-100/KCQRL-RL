@@ -27,5 +27,12 @@ evaluation:
 training:
   episodes: 10
   batch_size: 32
-  learning_rate: 0.0001
+  actor_lr: 0.00003
+  critic_lr: 0.00001
+  reward_scale: 10
+  q_clip: 20
+  policy_delay: 2
+  gradient_clip: 1.0
   output_dir: outputs
+  best_checkpoint_path: outputs/ddpg_actor_best.pt
+  final_checkpoint_path: outputs/ddpg_actor_final.pt

@@ -1,6 +1,6 @@
 # KCQRL-RL
 
-A minimal, runnable Knowledge-Concept Question Recommendation Learning (KCQRL-RL) framework for offline computerized adaptive testing (CAT) and reinforcement-learning policy evaluation.
+A minimal, runnable Knowledge-Concept Question Recommendation Learning (KCQRL-RL) framework for offline computerized adaptive testing (CAT) and DDPG policy training/evaluation.
 
 ## Repository layout
 
@@ -10,36 +10,45 @@ The project is intended to run from the repository root. Core folders live direc
 agents/ configs/ core/ datasets/ docs/ envs/ evaluation/ legacy/ models/ reward/ scripts/ utils/
 ```
 
-Large data assets and checkpoints are **not** committed. See `docs/ASSET_MANIFEST.md` and configure all external paths in `configs/default.yaml`.
+Large data assets and checkpoints are **not** committed. See `docs/ASSET_MANIFEST.md` and configure all external data paths in `configs/default.yaml`.
 
-## Colab quick start
+## Colab workflow
 
-```bash
-git clone https://github.com/<your-org>/KCQRL-RL.git
-cd KCQRL-RL
-pip install -r requirements.txt
-```
+1. Mount Google Drive in a Colab cell so `configs/default.yaml` can resolve the configured real data paths:
 
-Mount Google Drive in a Colab cell:
+   ```python
+   from google.colab import drive
+   drive.mount('/content/drive')
+   ```
 
-```python
-from google.colab import drive
-drive.mount('/content/drive')
-```
+2. Clone the repository and enter the repo root:
 
-Run debug evaluation:
+   ```bash
+   git clone https://github.com/<your-org>/KCQRL-RL.git
+   cd KCQRL-RL
+   ```
 
-```bash
-python scripts/evaluate.py --config configs/default.yaml --debug
-```
+3. Install dependencies:
 
-Run the training scaffold:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-```bash
-python scripts/train.py --config configs/default.yaml
-```
+4. Train the DDPG actor from the configured Google Drive assets:
 
-If Google Drive assets are unavailable, the scripts print the missing configured paths instead of crashing with import errors.
+   ```bash
+   python train.py --config configs/default.yaml
+   ```
+
+   Training writes the best-reward actor to `outputs/ddpg_actor_best.pt` and the final actor to `outputs/ddpg_actor_final.pt`.
+
+5. Evaluate the trained DDPG actor:
+
+   ```bash
+   python evaluate.py --config configs/default.yaml --debug --ddpg-checkpoint outputs/ddpg_actor_best.pt
+   ```
+
+If Google Drive assets are unavailable, the scripts print the missing configured paths instead of crashing with import errors. If the DDPG actor checkpoint is unavailable during evaluation, the evaluator prints a warning and falls back to the old heuristic policy.
 
 ## Offline evaluation
 
@@ -51,4 +60,4 @@ If Google Drive assets are unavailable, the scripts print the missing configured
 * `DDPG`
 * `OneStepOracle`
 
-This path does not require tokenizers, transformer models, `json_file_dataset`, `kc_questions_map`, or cluster JSON files.
+For DDPG, evaluation loads the trained LSTM actor checkpoint passed via `--ddpg-checkpoint`, builds candidate vectors from the same representation used during training (`q_matrix + NCDM difficulty + NCDM discrimination`), and selects the nearest candidate item to the actor's ideal action vector.
