@@ -1,0 +1,35 @@
+selection_horizon: 10
+epochs: 5
+max_students: 200
+batch_size: 16
+gamma: 0.99
+replay_capacity: 10000
+learning_rate: 0.0005
+gradient_clip: 5.0
+tau: 0.01
+target_update_interval: 1
+epsilon_start: 1.0
+epsilon_end: 0.05
+epsilon_decay_steps: 5000
+warm_start_items: 1
+model:
+  d_model: 128
+  n_heads: 4
+  num_history_layers: 2
+  dropout: 0.1
+alpha_fit:
+  steps: 8
+  lr: 0.05
+  early_stop_tol: 0.00001
+  warm_start_from_previous_alpha: false
+reward:
+  prediction_weight: 1.0
+  diagnosis_weight: 0.2
+  coverage_weight: 0.05
+  prediction_scale: 10.0
+  reward_clip: 5.0
+candidate_pool:
+  max_candidates: null
+  prefilter_enabled: false
+  prefilter_top_k: 256
+  prefilter_mode: diagnostic_heuristic
