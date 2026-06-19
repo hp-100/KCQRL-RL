@@ -22,6 +22,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Evaluate CAT/RL policies offline.")
     parser.add_argument("--config", default="configs/default.yaml", help="Path to YAML config.")
     parser.add_argument("--debug", action="store_true", help="Use small debug limits and print friendly diagnostics.")
+    parser.add_argument("--ddpg-checkpoint", default="outputs/ddpg_actor.pt", help="Path to trained DDPG actor checkpoint.")
     args = parser.parse_args(argv)
 
     config_path = Path(args.config)
@@ -29,7 +30,7 @@ def main(argv=None) -> int:
         config_path = ROOT / config_path
     try:
         config = load_config(config_path)
-        evaluator = CATOfflineEvaluator(config, debug=args.debug)
+        evaluator = CATOfflineEvaluator(config, debug=args.debug, ddpg_checkpoint=args.ddpg_checkpoint)
         results = evaluator.evaluate()
     except MissingAssetsError as exc:
         print("KCQRL-RL evaluation cannot run because external Google Drive assets are missing.")

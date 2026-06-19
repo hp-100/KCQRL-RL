@@ -18,7 +18,7 @@ def coverage_bonus(new_items, total_items):
     return len(set(new_items)) / max(1, total_items)
 
 
-def information_gain_reward(prev_entropy: float, curr_entropy: float, scale: float = 50.0, clip: float = 10.0) -> float:
+def information_gain_reward(prev_entropy: float, curr_entropy: float, scale: float = 10.0, clip: float = 10.0) -> float:
     return max(-clip, min(clip, (prev_entropy - curr_entropy) * scale))
 
 

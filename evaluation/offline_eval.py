@@ -63,7 +63,7 @@ class CATOfflineEvaluator:
     REQUIRED_ASSETS = ("q_matrix", "item_bank", "test_sequences")
     OPTIONAL_POLICY_ASSETS = {"DDPG": ("ncdm_checkpoint",), "MIRT-MFI": ("mirt_checkpoint",), "MIRT-KLI": ("mirt_checkpoint",)}
 
-    def __init__(self, config: Mapping, debug: bool = False):
+    def __init__(self, config: Mapping, debug: bool = False, ddpg_checkpoint: Optional[str] = None):
         self.config = config
         self.debug = debug
         self.seed = int(config.get("seed", 42))
@@ -74,6 +74,12 @@ class CATOfflineEvaluator:
         self.candidate_size = int(eval_cfg.get("candidate_size", 50))
         self.policies = list(eval_cfg.get("policies", ["Random", "MIRT-MFI", "MIRT-KLI", "DDPG", "OneStepOracle"]))
         self.paths = self._resolve_asset_paths(config.get("assets", {}) or {})
+        self.ddpg_checkpoint = Path(ddpg_checkpoint or "outputs/ddpg_actor.pt").expanduser()
+        self.ddpg_checkpoint = self.ddpg_checkpoint if self.ddpg_checkpoint.is_absolute() else Path.cwd() / self.ddpg_checkpoint
+        self.ddpg_actor = None
+        self.ddpg_ncdm = None
+        self.ddpg_device = torch.device("cuda" if torch is not None and torch.cuda.is_available() else "cpu") if torch is not None else None
+        self._warned_ddpg_fallback = False
 
     @staticmethod
     def _resolve_asset_paths(asset_cfg: Mapping[str, str]) -> Dict[str, Path]:
@@ -101,9 +107,10 @@ class CATOfflineEvaluator:
 
     def load(self) -> Tuple["np.ndarray", "np.ndarray", List[StudentSequence]]:
         self.ensure_assets()
-        q_matrix = self._load_array(self.paths["q_matrix"])
-        item_bank = self._load_array(self.paths["item_bank"])
+        q_matrix = self._load_array(self.paths["q_matrix"]).astype(np.float32)
+        item_bank = self._load_array(self.paths["item_bank"]).astype(np.float32)
         sequences = self._load_sequences(self.paths["test_sequences"])
+        self._prepare_ddpg(q_matrix, item_bank)
         return q_matrix, item_bank, sequences[: self.max_students]
 
     @staticmethod
@@ -127,6 +134,32 @@ class CATOfflineEvaluator:
         for ch in "[]()":
             value = value.replace(ch, " ")
         return [int(float(x)) for x in value.replace(";", ",").split(",") if x.strip()]
+
+
+    def _prepare_ddpg(self, q_matrix, item_bank) -> None:
+        if "DDPG" not in self.policies or torch is None:
+            return
+        if not self.ddpg_checkpoint.exists():
+            print("DDPG actor checkpoint not found; falling back to heuristic policy.")
+            self._warned_ddpg_fallback = True
+            return
+        from models.actor import LSTMActor
+        from models.ncdm import OfficialNCDM, safe_load_ncdm_checkpoint
+
+        q_tensor = torch.tensor(q_matrix, dtype=torch.float32, device=self.ddpg_device)
+        ncdm = OfficialNCDM(1, q_matrix.shape[0], q_matrix.shape[1]).to(self.ddpg_device)
+        safe_load_ncdm_checkpoint(ncdm, self.paths["ncdm_checkpoint"], self.ddpg_device)
+        ncdm.eval()
+        for param in ncdm.parameters():
+            param.requires_grad = False
+        actor = LSTMActor(semantic_dim=item_bank.shape[1], q_dim=q_matrix.shape[1]).to(self.ddpg_device)
+        state = torch.load(self.ddpg_checkpoint, map_location=self.ddpg_device)
+        actor.load_state_dict(state)
+        actor.eval()
+        self.ddpg_actor = actor
+        self.ddpg_ncdm = ncdm
+        self.ddpg_q_tensor = q_tensor
+        self.ddpg_item_bank = torch.tensor(item_bank, dtype=torch.float32, device=self.ddpg_device)
 
     def _load_sequences(self, path: Path) -> List[StudentSequence]:
         with path.open(newline="") as f:
@@ -161,37 +194,62 @@ class CATOfflineEvaluator:
         for seq in sequences:
             ability = np.zeros(q_matrix.shape[1], dtype=float)
             seen = set()
+            ddpg_hx = ddpg_cx = None
+            last_item = last_response = None
             for _ in range(min(self.horizon, len(seq.item_ids))):
                 candidates = [i for i in seq.item_ids if i not in seen and i < len(q_matrix)]
                 if not candidates:
                     break
                 if len(candidates) > self.candidate_size:
                     candidates = candidates[: self.candidate_size]
-                item = self._select(policy, candidates, ability, q_matrix, item_bank, seq)
+                item, ddpg_hx, ddpg_cx = self._select(policy, candidates, ability, q_matrix, item_bank, seq, ddpg_hx, ddpg_cx, last_item, last_response)
                 seen.add(item)
                 response = seq.responses[seq.item_ids.index(item)]
                 pred = self._predict(ability, q_matrix[item])
                 correct += int((pred >= 0.5) == (response >= 0.5))
                 reward_sum += 1.0 if (pred >= 0.5) == (response >= 0.5) else 0.0
                 ability += (response - pred) * q_matrix[item]
+                last_item, last_response = item, response
                 interactions += 1
         acc = correct / interactions if interactions else 0.0
         return EvaluationResult(policy, len(sequences), interactions, acc, reward_sum / interactions if interactions else 0.0)
 
-    def _select(self, policy: str, candidates: Sequence[int], ability, q_matrix, item_bank, seq: StudentSequence) -> int:
+    def _select(self, policy: str, candidates: Sequence[int], ability, q_matrix, item_bank, seq: StudentSequence, ddpg_hx=None, ddpg_cx=None, last_item=None, last_response=None):
         if policy == "Random":
-            return self.rng.choice(list(candidates))
+            return self.rng.choice(list(candidates)), ddpg_hx, ddpg_cx
         if policy == "OneStepOracle":
-            return max(candidates, key=lambda item: abs(seq.responses[seq.item_ids.index(item)] - self._predict(ability, q_matrix[item])))
+            return max(candidates, key=lambda item: abs(seq.responses[seq.item_ids.index(item)] - self._predict(ability, q_matrix[item]))), ddpg_hx, ddpg_cx
         probs = [(item, self._predict(ability, q_matrix[item])) for item in candidates]
         if policy == "MIRT-MFI":
-            return max(probs, key=lambda x: x[1] * (1.0 - x[1]))[0]
+            return max(probs, key=lambda x: x[1] * (1.0 - x[1]))[0], ddpg_hx, ddpg_cx
         if policy == "MIRT-KLI":
-            return max(probs, key=lambda x: abs(x[1] - 0.5))[0]
+            return max(probs, key=lambda x: abs(x[1] - 0.5))[0], ddpg_hx, ddpg_cx
         if policy == "DDPG":
+            if self.ddpg_actor is not None:
+                with torch.no_grad():
+                    if ddpg_hx is None or ddpg_cx is None:
+                        ddpg_hx, ddpg_cx = self.ddpg_actor.init_hidden(1, self.ddpg_device)
+                    if last_item is None:
+                        sem = torch.zeros((1, self.ddpg_item_bank.shape[1]), dtype=torch.float32, device=self.ddpg_device)
+                        q = torch.zeros((1, self.ddpg_q_tensor.shape[1]), dtype=torch.float32, device=self.ddpg_device)
+                        diff = torch.zeros_like(q)
+                        disc = torch.zeros((1, 1), dtype=torch.float32, device=self.ddpg_device)
+                        resp = torch.zeros(1, dtype=torch.float32, device=self.ddpg_device)
+                    else:
+                        tid = torch.tensor([last_item], dtype=torch.long, device=self.ddpg_device)
+                        sem = self.ddpg_item_bank[last_item].unsqueeze(0)
+                        q = self.ddpg_q_tensor[last_item].unsqueeze(0)
+                        diff = torch.sigmoid(self.ddpg_ncdm.k_difficulty(tid))
+                        disc = torch.sigmoid(self.ddpg_ncdm.e_discrimination(tid))
+                        resp = torch.tensor([float(last_response)], dtype=torch.float32, device=self.ddpg_device)
+                    ideal, ddpg_hx, ddpg_cx = self.ddpg_actor(sem, q, diff, disc, resp, ddpg_hx, ddpg_cx)
+                    cand_ids = torch.tensor(list(candidates), dtype=torch.long, device=self.ddpg_device)
+                    cand_vecs = torch.cat([self.ddpg_q_tensor[cand_ids], torch.sigmoid(self.ddpg_ncdm.k_difficulty(cand_ids)), torch.sigmoid(self.ddpg_ncdm.e_discrimination(cand_ids))], dim=-1)
+                    loc = int(torch.argmin(torch.cdist(ideal, cand_vecs).squeeze(0)).item())
+                    return int(candidates[loc]), ddpg_hx.detach(), ddpg_cx.detach()
             target = ability[: item_bank.shape[1]] if item_bank.ndim == 2 else ability
-            return max(candidates, key=lambda item: float(np.dot(item_bank[item][: len(target)], target)))
-        return self.rng.choice(list(candidates))
+            return max(candidates, key=lambda item: float(np.dot(item_bank[item][: len(target)], target))), ddpg_hx, ddpg_cx
+        return self.rng.choice(list(candidates)), ddpg_hx, ddpg_cx
 
     @staticmethod
     def _predict(ability, q_vec) -> float:
