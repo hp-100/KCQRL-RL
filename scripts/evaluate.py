@@ -11,6 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from evaluation.offline_eval import CATOfflineEvaluator, MissingAssetsError
+from evaluation.benchmark import BenchmarkV2Evaluator
 from utils.config import load_yaml_config
 
 
@@ -23,6 +24,11 @@ def main(argv=None) -> int:
     parser.add_argument("--config", default="configs/default.yaml", help="Path to YAML config.")
     parser.add_argument("--debug", action="store_true", help="Use small debug limits and print friendly diagnostics.")
     parser.add_argument("--ddpg-checkpoint", default="outputs/ddpg_actor.pt", help="Path to trained DDPG actor checkpoint.")
+    parser.add_argument("--protocol", default=None, help="Evaluation protocol: legacy or benchmark_v2.")
+    parser.add_argument("--seeds", default=None, help="Comma-separated benchmark seeds.")
+    parser.add_argument("--max-students", type=int, default=None, help="Maximum students for benchmark_v2.")
+    parser.add_argument("--steps", default=None, help="Comma-separated benchmark checkpoints.")
+    parser.add_argument("--output-dir", default=None, help="benchmark_v2 output directory.")
     args = parser.parse_args(argv)
 
     config_path = Path(args.config)
@@ -30,6 +36,18 @@ def main(argv=None) -> int:
         config_path = ROOT / config_path
     try:
         config = load_config(config_path)
+        protocol = args.protocol or (config.get("benchmark", {}) or {}).get("protocol")
+        if protocol == "benchmark_v2":
+            seeds = [int(x) for x in args.seeds.split(",")] if args.seeds else None
+            steps = [int(x) for x in args.steps.split(",")] if args.steps else None
+            evaluator = BenchmarkV2Evaluator(config, debug=args.debug, ddpg_checkpoint=args.ddpg_checkpoint, seeds=seeds, max_students=args.max_students, steps=steps, output_dir=args.output_dir)
+            rows = evaluator.run()
+            print(f"benchmark_v2 complete: wrote outputs to {evaluator.output_dir}")
+            print("policy,seed,step,students,accuracy_micro,auc_micro,nll_micro,brier_micro")
+            for r in rows:
+                print(f"{r['policy']},{r['seed']},{r['step']},{r['students']},{float(r['accuracy_micro']):.4f},{float(r['auc_micro']):.4f},{float(r['nll_micro']):.4f},{float(r['brier_micro']):.4f}")
+            return 0
+        print("Legacy evaluation protocol is not recommended for paper results. Use --protocol benchmark_v2.")
         evaluator = CATOfflineEvaluator(config, debug=args.debug, ddpg_checkpoint=args.ddpg_checkpoint)
         results = evaluator.evaluate()
     except MissingAssetsError as exc:

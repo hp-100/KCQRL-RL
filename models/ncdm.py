@@ -98,8 +98,9 @@ def fit_student_alpha(model: OfficialNCDM, q_matrix: torch.Tensor, history_i: Se
         init = torch.log(mean_diff / (1.0 - mean_diff))
     alpha = init.unsqueeze(0).detach().clone().requires_grad_(True)
     opt = optim.Adam([alpha], lr=lr)
-    was_training = model.training
-    model.train()
+    for param in model.parameters():
+        param.requires_grad_(False)
+    model.eval()
     for step_idx in range(steps):
         opt.zero_grad()
         loss = nn.BCELoss()(model.predict_with_alpha(alpha, items, q_matrix), responses)
@@ -107,7 +108,7 @@ def fit_student_alpha(model: OfficialNCDM, q_matrix: torch.Tensor, history_i: Se
         opt.step()
         if step_idx >= 5 and loss.item() < 1e-3:
             break
-    model.train(was_training)
+    model.eval()
     return alpha.detach()
 
 
