@@ -8,7 +8,7 @@ from core.mirt_state_builder import build_mirt_state, compute_action_normalizer,
 from evaluation.offline_eval import StudentSequence
 from evaluation.metrics import metric_bundle, nll_score
 from models.mirt import load_mirt_checkpoint, fit_student_theta, predict_with_theta
-from models.mirt_actor import MIRTActor, STATE_DEFINITION_VERSION
+from models.mirt_actor import MIRTActor, STATE_DEFINITION_VERSION, ACTOR_ARCHITECTURE
 from models.mirt_critic import MIRTCritic
 from reward.mirt_reward import query_nll, nll_drop_reward
 
@@ -54,7 +54,7 @@ class MIRTDDPGTrainer:
             hist_i=[]; hist_r=[]; cand=list(supp)
             for step in range(min(10,len(cand))):
                 st=build_mirt_state(self.mirt,hist_i,hist_r,step,self.max_steps,self.theta_cfg,self.device)
-                with torch.no_grad(): a,_,_=actor(st)
+                with torch.no_grad(): a=actor(st)
                 it=nearest_item(a.squeeze(0),cand,self.mirt,normalizer,self.device); j=cand.index(it); cand.pop(j); hist_i.append(it); hist_r.append(sr[supp.index(it)])
             th=fit_student_theta(self.mirt,hist_i,hist_r,device=self.device,**self.theta_cfg)
             p=predict_with_theta(self.mirt,th,query).detach().cpu().tolist(); mb=metric_bundle(qr,p); vals.append(mb['nll']); auc.append(mb['auc'])
@@ -75,16 +75,16 @@ class MIRTDDPGTrainer:
                 for step in range(min(self.max_steps,len(cand))):
                     st=build_mirt_state(self.mirt,hi,hr,step,self.max_steps,self.theta_cfg,self.device)
                     th=fit_student_theta(self.mirt,hi,hr,device=self.device,**self.theta_cfg); prev=query_nll(self.mirt,th,query,qr) if prev is None else prev
-                    with torch.no_grad(): act,_,_=actor(st); act=act.squeeze(0)+torch.randn(37,device=self.device)*0.1
+                    with torch.no_grad(): act=actor(st); act=act.squeeze(0)+torch.randn(37,device=self.device)*0.1
                     it=nearest_item(act,cand,self.mirt,normalizer,self.device); uniq.add(it); cand.remove(it); hi2=hi+[it]; hr2=hr+[sr[supp.index(it)]]
                     th2=fit_student_theta(self.mirt,hi2,hr2,device=self.device,**self.theta_cfg); cur=query_nll(self.mirt,th2,query,qr); r=nll_drop_reward(prev,cur,self.config.get('training',{}).get('reward_scale',10.0),self.config.get('training',{}).get('reward_clip',5.0)); rewards.append(r)
                     ns=build_mirt_state(self.mirt,hi2,hr2,step+1,self.max_steps,self.theta_cfg,self.device); rb.push(st.cpu().numpy(), act.detach().cpu().numpy(), r, ns.cpu().numpy(), float(step+1>=self.max_steps or not cand)); hi,hr,prev=hi2,hr2,cur
                     if len(rb)>=self.batch_size:
                         s,a,rw,nsb,d=rb.sample(self.batch_size,self.device); rw=rw.view(-1,1); d=d.view(-1,1)
-                        with torch.no_grad(): na,_,_=targ_a(nsb); y=rw+self.gamma*(1-d)*targ_c(nsb,na)
-                        q=critic(s,a); loss=F.huber_loss(q,y.clamp(-self.q_clip,self.q_clip)); co.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(critic.parameters(),1.0); co.step(); cl=float(loss); mq=float(q.mean()); tq=float(y.mean()); qfrac=float((q.abs()>self.q_clip*.99).float().mean())
+                        with torch.no_grad(): na=targ_a(nsb); y=rw+self.gamma*(1-d)*targ_c(nsb,na)
+                        q=critic(s,a); loss=F.huber_loss(q,y.clamp(-self.q_clip,self.q_clip)); co.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(critic.parameters(),1.0); co.step(); cl=loss.detach().item(); mq=q.detach().mean().item(); tq=y.detach().mean().item(); qfrac=(q.detach().abs()>self.q_clip*.99).float().mean().item()
                         if updates%self.policy_delay==0:
-                            pa,_,_=actor(s); lossa=-critic(s,pa).mean(); ao.zero_grad(); lossa.backward(); torch.nn.utils.clip_grad_norm_(actor.parameters(),1.0); ao.step(); al=float(lossa)
+                            pa=actor(s); lossa=-critic(s,pa).mean(); ao.zero_grad(); lossa.backward(); torch.nn.utils.clip_grad_norm_(actor.parameters(),1.0); ao.step(); al=lossa.detach().item()
                             self._soft(actor,targ_a); self._soft(critic,targ_c)
                         updates+=1; self._assert_frozen()
             vm=self._validate(actor,rows,normalizer); rec={'epoch':ep,'mean_reward':float(np.mean(rewards)) if rewards else 0.0,'critic_loss':cl,'actor_loss':al,'mean_q':mq,'target_q_mean':tq,'q_clip_fraction':qfrac,'selected_unique_items':len(uniq),**vm}; hist.append(rec)
@@ -97,4 +97,4 @@ class MIRTDDPGTrainer:
     def _save(self,actor,norm,epoch,metrics,name):
         try: git=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
         except Exception: git=None
-        torch.save({'actor_state_dict':actor.state_dict(),'action_mean':norm.mean,'action_std':norm.std,'mirt_dim':self.mirt.n_dims,'hidden_dim':actor.hidden_dim,'state_definition_version':STATE_DEFINITION_VERSION,'training_config':self.config,'epoch':epoch,'validation_metrics':metrics,'git_commit':git}, self.out/name)
+        torch.save({'actor_state_dict':actor.state_dict(),'action_mean':norm.mean,'action_std':norm.std,'mirt_dim':self.mirt.n_dims,'hidden_dim':actor.hidden_dim,'state_definition_version':STATE_DEFINITION_VERSION,'actor_architecture':ACTOR_ARCHITECTURE,'theta_fit':self.theta_cfg,'training_config':self.config,'epoch':epoch,'validation_metrics':metrics,'git_commit':git}, self.out/name)

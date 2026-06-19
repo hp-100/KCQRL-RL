@@ -27,8 +27,14 @@ class StudentSplit:
         return asdict(self)
 
 
-def valid_item_count(q_matrix, item_bank, ncdm=None, mirt=None) -> int:
-    counts = [len(q_matrix), len(item_bank)]
+def valid_item_count(q_matrix, item_bank=None, ncdm=None, mirt=None, *, track: str | None = None) -> int:
+    if track == "mirt_native":
+        if mirt is None:
+            raise ValueError("mirt_native valid_item_count requires a MIRT model")
+        return int(min(mirt.disc_emb.num_embeddings, mirt.diff_emb.num_embeddings))
+    counts = [len(q_matrix)]
+    if item_bank is not None:
+        counts.append(len(item_bank))
     if ncdm is not None:
         counts.extend([ncdm.k_difficulty.num_embeddings, ncdm.e_discrimination.num_embeddings])
     if mirt is not None:

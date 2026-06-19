@@ -36,12 +36,23 @@ class BenchmarkV2Evaluator:
         self.ddpg_checkpoint = Path(ddpg_checkpoint)
         self.ddpg_mirt_checkpoint = Path(ddpg_mirt_checkpoint or b.get("ddpg_mirt_checkpoint", "outputs/mirt_ddpg/ddpg_mirt_actor_best.pt"))
         self.track = track or b.get("track", "benchmark_v2")
-        if self.track == "mirt_native" and policies is None:
+        if self.track == "mirt_native" and policies is None and "policies" not in b:
             self.policy_names = ["Random-MIRT","MIRT-Trace-MFI","MIRT-D-opt","MIRT-MKLI","DDPG-MIRT"]
         self.device = torch.device("cuda" if torch.cuda.is_available() and config.get("device") != "cpu" else "cpu")
 
     def _load_or_synthetic(self):
         legacy = CATOfflineEvaluator(self.config, debug=self.debug, ddpg_checkpoint=str(self.ddpg_checkpoint))
+        if self.track == "mirt_native" and not self.debug:
+            paths = legacy.paths
+            needed = [paths[k] for k in ("mirt_checkpoint", "test_sequences") if k in paths and not paths[k].exists()]
+            if needed:
+                raise MissingAssetsError(needed)
+            mirt = load_mirt_checkpoint(paths["mirt_checkpoint"], self.device)
+            seqs = legacy._load_sequences(paths["test_sequences"])
+            q = legacy._load_array(paths["q_matrix"]).astype(np.float32) if "q_matrix" in paths and paths["q_matrix"].exists() else np.zeros((mirt.n_items, mirt.n_dims), dtype=np.float32)
+            item_bank = np.zeros((0, 0), dtype=np.float32)
+            self.mirt_model = mirt
+            return q, item_bank, seqs[:self.max_students], None, False
         missing = legacy.missing_required_assets()
         if missing and self.debug:
             q = np.eye(6, dtype=np.float32)[np.arange(30) % 6]
@@ -79,6 +90,10 @@ class BenchmarkV2Evaluator:
         self.mirt_model = mirt
         return q, item_bank, seqs[:self.max_students], ncdm, False
 
+    def _theta_cfg(self):
+        mcfg=dict((self.config.get("benchmark") or {}).get("mirt") or {})
+        return {"steps":int(mcfg.get("theta_steps",30)),"lr":float(mcfg.get("theta_lr",0.05)),"theta_l2":float(mcfg.get("theta_l2",0.01)),"grad_clip":float(mcfg.get("theta_grad_clip",5.0)),"early_stop_tol":float(mcfg.get("early_stop_tol",1e-5))}
+
     def _predict(self, ncdm, q_tensor, hist_i, hist_r, target_i):
         if not target_i: return []
         alpha = fit_student_alpha(ncdm, q_tensor, hist_i, hist_r, steps=(2 if self.debug else 8), device=self.device)
@@ -95,7 +110,7 @@ class BenchmarkV2Evaluator:
         available={"Random": lambda: RandomPolicy(), "Random-MIRT": lambda: RandomMIRTPolicy(), "MIRT-MFI": lambda: HeuristicMIRTPolicy("MIRT-MFI"), "MIRT-KLI": lambda: HeuristicMIRTPolicy("MIRT-KLI"), "OneStepOracle": lambda: OneStepOraclePolicy()}
         mcfg=dict((self.config.get("benchmark") or {}).get("mirt") or {})
         real_mirt={"MIRT-Trace-MFI","MIRT-D-opt","MIRT-MKLI","MIRT-Local-KLI"}
-        theta_cfg={"steps":int(mcfg.get("theta_steps",30)),"lr":float(mcfg.get("theta_lr",0.05)),"theta_l2":float(mcfg.get("theta_l2",0.01)),"grad_clip":float(mcfg.get("theta_grad_clip",5.0)),"early_stop_tol":float(mcfg.get("early_stop_tol",1e-5))}
+        theta_cfg=self._theta_cfg()
         policies=[]
         for name in self.policy_names:
             if name == "DDPG-MIRT":
@@ -123,7 +138,7 @@ class BenchmarkV2Evaluator:
 
     def _predict_mirt(self, mirt, hist_i, hist_r, target_i):
         if not target_i: return []
-        theta = fit_mirt_theta(mirt, hist_i, hist_r, steps=(2 if self.debug else 8), device=self.device)
+        theta = fit_mirt_theta(mirt, hist_i, hist_r, device=self.device, **self._theta_cfg())
         with torch.no_grad():
             out = mirt_predict_with_theta(mirt, theta, target_i)
         return [float(x) for x in out.detach().cpu().tolist()]
@@ -133,8 +148,8 @@ class BenchmarkV2Evaluator:
         q, item_bank, seqs, ncdm, synthetic = self._load_or_synthetic()
         mirt = getattr(self, "mirt_model", None)
         q_tensor=torch.tensor(q,dtype=torch.float32,device=self.device)
-        vcount=valid_item_count(q, item_bank, ncdm, mirt)
-        counts_msg={"q_matrix":len(q),"item_bank":len(item_bank),"ncdm_items":int(ncdm.k_difficulty.num_embeddings),"mirt_items":int(mirt.n_items) if mirt is not None else None,"valid_item_count":int(vcount)}
+        vcount=valid_item_count(q, item_bank, ncdm, mirt, track=self.track)
+        counts_msg={"q_matrix":len(q),"item_bank":len(item_bank),"ncdm_items":int(ncdm.k_difficulty.num_embeddings) if ncdm is not None else None,"mirt_items":int(mirt.n_items) if mirt is not None else None,"valid_item_count":int(vcount)}
         print(f"benchmark_v2 valid_item_count: {counts_msg}")
         all_rows=[]; pred_rows=[]; student_rows=[]; traces=[]; metadata={}
         for seed in self.seeds:
@@ -184,8 +199,9 @@ class BenchmarkV2Evaluator:
                     micro=metric_bundle(yt,ys); macros={k:nanmean([m[k] for m in step_stu[step]]) for k in ["accuracy","auc","nll","brier"]}
                     cnt=Counter(); [cnt.update(c) for s,c in exposures.items() if s<=step]
                     concepts=set();
-                    for item in cnt: concepts.update(np.nonzero(q[item])[0].tolist())
-                    all_rows.append({"policy":pol.name,"seed":seed,"step":step,"students":evaluated_students,"eligible_students":eligible_students,"evaluated_students":evaluated_students,"incomplete_students":incomplete_students,"valid_students":len(splits),"skipped_students":len(skipped),"query_interactions":q_inter[step],"selected_items":sum(cnt.values()),"average_test_length":(sum(cnt.values())/evaluated_students if evaluated_students else 0),"accuracy_micro":micro["accuracy"],"auc_micro":micro["auc"],"nll_micro":micro["nll"],"brier_micro":micro["brier"],"accuracy_macro":macros["accuracy"],"auc_macro":macros["auc"],"nll_macro":macros["nll"],"brier_macro":macros["brier"],"concept_coverage":len(concepts)/q.shape[1],"unique_item_count":len(cnt),"item_exposure_max":max(cnt.values()) if cnt else 0,"item_exposure_gini":gini(cnt.values())})
+                    for item in cnt:
+                        if 0 <= int(item) < len(q): concepts.update(np.nonzero(q[int(item)])[0].tolist())
+                    all_rows.append({"policy":pol.name,"seed":seed,"step":step,"students":evaluated_students,"eligible_students":eligible_students,"evaluated_students":evaluated_students,"incomplete_students":incomplete_students,"valid_students":len(splits),"skipped_students":len(skipped),"query_interactions":q_inter[step],"selected_items":sum(cnt.values()),"average_test_length":(sum(cnt.values())/evaluated_students if evaluated_students else 0),"accuracy_micro":micro["accuracy"],"auc_micro":micro["auc"],"nll_micro":micro["nll"],"brier_micro":micro["brier"],"accuracy_macro":macros["accuracy"],"auc_macro":macros["auc"],"nll_macro":macros["nll"],"brier_macro":macros["brier"],"concept_coverage":(len(concepts)/q.shape[1] if getattr(q, "shape", (0,0))[1] else 0.0),"unique_item_count":len(cnt),"item_exposure_max":max(cnt.values()) if cnt else 0,"item_exposure_gini":gini(cnt.values())})
         self._write_csv(self.output_dir/"per_seed.csv", all_rows)
         agg=[]
         for key in sorted({(r['policy'],r['step']) for r in all_rows}):

@@ -1,6 +1,6 @@
 import pytest, torch
 from models.mirt import MIRTModel, fit_student_theta
-from models.mirt_actor import MIRTActor
+from models.mirt_actor import MIRTActor, ACTOR_ARCHITECTURE
 from core.mirt_state_builder import compute_action_normalizer, item_action_features, nearest_item
 from reward.mirt_reward import bernoulli_nll, nll_drop_reward
 from evaluation.policies.ddpg_mirt_policy import DDPGMIRTPolicy
@@ -15,11 +15,14 @@ def make_mirt(n_items=6, dim=36):
     return m.eval()
 
 
-def test_mirt_actor_shapes():
+def test_mirt_actor_is_declared_mlp_and_has_no_recurrent_interface():
     a=MIRTActor()
-    out,h,c=a(torch.zeros(4,75))
+    out=a(torch.zeros(4,75))
     assert out.shape==(4,37)
-    assert h.shape==(4,128)
+    assert ACTOR_ARCHITECTURE == "mlp_explicit_state"
+    assert not any(isinstance(m, torch.nn.LSTMCell) for m in a.modules())
+    with pytest.raises(TypeError):
+        a(torch.zeros(4,75), torch.zeros(4,128), torch.zeros(4,128))
 
 
 def test_action_normalization_roundtrip_and_nearest():
@@ -51,3 +54,22 @@ def test_ddpg_mirt_checkpoint_requires_action_stats(tmp_path):
     ck=tmp_path/'bad.pt'; torch.save({'actor_state_dict':MIRTActor().state_dict()}, ck)
     with pytest.raises(KeyError):
         DDPGMIRTPolicy(ck, make_mirt())
+
+
+def test_ddpg_mirt_checkpoint_uses_checkpoint_theta_cfg(tmp_path):
+    ck=tmp_path/'ok.pt'
+    actor=MIRTActor()
+    theta_fit={'steps':7,'lr':0.2,'theta_l2':0.03,'grad_clip':1.5,'early_stop_tol':0.0}
+    torch.save({'actor_state_dict':actor.state_dict(),'action_mean':torch.zeros(37),'action_std':torch.ones(37),'hidden_dim':128,'actor_architecture':ACTOR_ARCHITECTURE,'theta_fit':theta_fit}, ck)
+    pol=DDPGMIRTPolicy(ck, make_mirt(), theta_cfg={'steps':1})
+    assert pol.theta_cfg == theta_fit
+
+
+def test_trainer_scalar_logging_detaches_before_item():
+    src=__import__('pathlib').Path('agents/mirt_ddpg_trainer.py').read_text()
+    assert 'float(loss)' not in src
+    assert 'float(q.mean())' not in src
+    assert 'float(y.mean())' not in src
+    assert 'loss.detach().item()' in src
+    assert 'q.detach().mean().item()' in src
+    assert 'y.detach().mean().item()' in src
