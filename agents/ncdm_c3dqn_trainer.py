@@ -21,6 +21,7 @@ from evaluation.protocol import make_student_split, valid_item_count
 from models.ncdm import fit_student_alpha
 from models.ncdm_candidate_features import NCDMItemFeatureCache, pad_c3dqn_batch
 from models.ncdm_candidate_q_network import CandidateConditionedNCDMQNetwork
+from models.set_ncdm_candidate_q_network import SetConditionedNCDMQNetwork, RELATIVE_FEATURE_NAMES
 from reward.ncdm_diagnostic_reward import NCDMDiagnosticRewardConfig, compute_ncdm_diagnostic_reward, mastery_entropy
 
 
@@ -42,6 +43,10 @@ class C3DQNTransition:
     next_coverage: list[float]
     next_policy_step: int
     done: bool
+    coverage_count: list[float] | None = None
+    next_coverage_count: list[float] | None = None
+    raw_candidate_count: int = 0
+    filtered_candidate_count: int = 0
 
 
 class C3DQNReplayBuffer:
@@ -86,10 +91,56 @@ def _samples_from_transitions(transitions: Sequence[C3DQNTransition], *, next_st
             "candidate_item_ids": cands,
             "mastery": t.next_mastery if next_state else t.mastery,
             "coverage": t.next_coverage if next_state else t.coverage,
+            "coverage_count": (t.next_coverage_count if next_state else t.coverage_count) or (t.next_coverage if next_state else t.coverage),
             "policy_step": t.next_policy_step if next_state else t.policy_step,
             "selected_item_id": cands[0] if next_state else t.selected_item_id,
         })
     return rows
+
+
+def forward_q_network(network: nn.Module, batch: dict[str, torch.Tensor], *, chunk_size: int | None = None):
+    if isinstance(network, SetConditionedNCDMQNetwork):
+        if chunk_size:
+            return network.forward_chunked(
+                batch["history_features"], batch["history_mask"], batch["candidate_features"],
+                batch["candidate_mask"], batch["global_features"], coverage_count=batch.get("coverage_count"), chunk_size=chunk_size
+            )
+        return network(batch["history_features"], batch["history_mask"], batch["candidate_features"], batch["candidate_mask"], batch["global_features"], coverage_count=batch.get("coverage_count"))
+    return network(batch["history_features"], batch["history_mask"], batch["candidate_features"], batch["candidate_mask"], batch["global_features"])
+
+
+class NCDMCandidatePrefilter:
+    def __init__(self, *, enabled: bool = False, top_k: int = 256, diversity_quota: int = 0, weights: dict[str, float] | None = None):
+        self.enabled=bool(enabled); self.top_k=int(top_k); self.diversity_quota=int(diversity_quota); self.weights=weights or {}
+    def filter(self, candidate_ids: Sequence[int], *, ncdm=None, alpha=None, q_matrix: torch.Tensor, mastery: torch.Tensor, coverage_count: torch.Tensor) -> tuple[list[int], dict[str,float]]:
+        ids=[int(x) for x in candidate_ids]
+        if not self.enabled:
+            return ids, {"raw_candidate_count":len(ids),"filtered_candidate_count":len(ids),"score_mean":0.0,"score_max":0.0}
+        if not ids: return [], {"raw_candidate_count":0,"filtered_candidate_count":0,"score_mean":0.0,"score_max":0.0}
+        dev=q_matrix.device; idt=torch.tensor(ids,dtype=torch.long,device=dev); qm=q_matrix[idt].float(); cc=coverage_count.to(dev).float(); m=mastery.to(dev).float().flatten()
+        if ncdm is not None and alpha is not None:
+            with torch.no_grad(): p=ncdm.predict_with_alpha(alpha, idt, q_matrix).float().flatten()
+            uncertainty=4.0*p*(1.0-p)
+        else: uncertainty=torch.ones(len(ids),device=dev)
+        cnt=qm.sum(1).clamp_min(1.0); weakness=((1-m).unsqueeze(0)*qm).sum(1)/cnt; novelty=(qm*(cc.unsqueeze(0)==0).float()).sum(1)/cnt
+        diff_match=torch.ones_like(weakness); disc=torch.zeros_like(weakness)
+        w=lambda n,d: float(self.weights.get(n,d))
+        score=w('uncertainty',1)*uncertainty+w('weakness',1)*weakness+w('novelty',1)*novelty+w('difficulty',1)*diff_match+w('discrimination',1)*disc
+        order=sorted(range(len(ids)), key=lambda i:(-float(score[i].item()), ids[i]))
+        top_k=min(self.top_k,len(ids)); div=min(self.diversity_quota,top_k,len(ids)); primary_slots=top_k-div
+        selected=[ids[i] for i in order[:primary_slots]]; selected_set=set(selected); current=cc.clone()
+        for sid in selected: current += q_matrix[sid].to(dev).float()
+        for _ in range(div):
+            best=None
+            for i in order:
+                item=ids[i]
+                if item in selected_set: continue
+                gain=float((q_matrix[item].to(dev).float()*(current==0).float()).sum().item())
+                key=(gain,float(score[i].item()),-item)
+                if best is None or key>best[0]: best=(key,item)
+            if best is None: break
+            item=best[1]; selected.append(item); selected_set.add(item); current += q_matrix[item].to(dev).float()
+        vals=score.detach().cpu(); return selected,{"raw_candidate_count":len(ids),"filtered_candidate_count":len(selected),"score_mean":float(vals.mean()),"score_max":float(vals.max())}
 
 
 def compute_double_dqn_loss(
@@ -101,22 +152,23 @@ def compute_double_dqn_loss(
     dones: torch.Tensor,
     gamma: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    q_values, _ = online_net(batch["history_features"], batch["history_mask"], batch["candidate_features"], batch["candidate_mask"], batch["global_features"])
+    q_values, _ = forward_q_network(online_net, batch)
     chosen_q = q_values.gather(1, batch["action_index"].view(-1, 1)).squeeze(1)
     with torch.no_grad():
-        next_q = torch.zeros_like(rewards)
+        next_q = torch.zeros_like(rewards, dtype=torch.float32)
         next_action_mean = 0.0
-        non_terminal = ~dones.bool()
-        if next_batch is not None and non_terminal.any():
-            next_online_q, _ = online_net(next_batch["history_features"], next_batch["history_mask"], next_batch["candidate_features"], next_batch["candidate_mask"], next_batch["global_features"])
+        non_terminal_indices = torch.nonzero(~dones.bool(), as_tuple=False).flatten()
+        if next_batch is not None and non_terminal_indices.numel():
+            if next_batch["history_features"].shape[0] != non_terminal_indices.numel():
+                raise ValueError("next_batch row count must equal non-terminal index count")
+            next_online_q, _ = forward_q_network(online_net, next_batch)
             next_action = masked_argmax(next_online_q, next_batch["candidate_mask"])
             next_action_mean = float(next_action.float().mean().item())
-            next_target_q, _ = target_net(next_batch["history_features"], next_batch["history_mask"], next_batch["candidate_features"], next_batch["candidate_mask"], next_batch["global_features"])
-            next_q[non_terminal] = next_target_q.gather(1, next_action.view(-1, 1)).squeeze(1)
-        target = rewards + float(gamma) * next_q
-    loss = F.smooth_l1_loss(chosen_q, target)
+            next_target_q, _ = forward_q_network(target_net, next_batch)
+            next_q[non_terminal_indices] = next_target_q.gather(1, next_action.view(-1, 1)).squeeze(1).float()
+        target = rewards.float() + float(gamma) * next_q
+    loss = F.smooth_l1_loss(chosen_q.float(), target.float())
     return loss, {"mean_q": float(chosen_q.mean().item()), "target_q_mean": float(target.mean().item()), "next_q_mean": float(next_q.mean().item()), "next_action_mean": next_action_mean}
-
 
 def transitions_to_batches(transitions: Sequence[C3DQNTransition], cache: NCDMItemFeatureCache, selection_horizon: int) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor] | None, torch.Tensor, torch.Tensor]:
     batch = pad_c3dqn_batch(_samples_from_transitions(transitions), cache, selection_horizon)
@@ -126,24 +178,8 @@ def transitions_to_batches(transitions: Sequence[C3DQNTransition], cache: NCDMIt
         if not t.done and t.next_candidate_item_ids:
             nt_indices.append(idx)
             cands = t.next_candidate_item_ids
-            next_rows.append({"history_item_ids": t.next_history_item_ids, "history_responses": t.next_history_responses, "candidate_item_ids": cands, "mastery": t.next_mastery, "coverage": t.next_coverage, "policy_step": t.next_policy_step, "selected_item_id": cands[0]})
+            next_rows.append({"history_item_ids": t.next_history_item_ids, "history_responses": t.next_history_responses, "candidate_item_ids": cands, "mastery": t.next_mastery, "coverage": t.next_coverage, "coverage_count": t.next_coverage_count or t.next_coverage, "policy_step": t.next_policy_step, "selected_item_id": cands[0]})
     next_batch = pad_c3dqn_batch(next_rows, cache, selection_horizon) if next_rows else None
-    if next_batch is not None and len(nt_indices) != len(transitions):
-        # compute_double_dqn_loss expects next batch rows to align with non-terminal subset
-        old_compute = compute_double_dqn_loss
-        def _loss(online, target, b, nb, rewards, dones, gamma):
-            q_values, _ = online(b["history_features"], b["history_mask"], b["candidate_features"], b["candidate_mask"], b["global_features"])
-            chosen_q = q_values.gather(1, b["action_index"].view(-1, 1)).squeeze(1)
-            with torch.no_grad():
-                next_q = torch.zeros_like(rewards)
-                no, _ = online(nb["history_features"], nb["history_mask"], nb["candidate_features"], nb["candidate_mask"], nb["global_features"])
-                na = masked_argmax(no, nb["candidate_mask"])
-                nt, _ = target(nb["history_features"], nb["history_mask"], nb["candidate_features"], nb["candidate_mask"], nb["global_features"])
-                idx_t = torch.tensor(nt_indices, dtype=torch.long, device=rewards.device)
-                next_q[idx_t] = nt.gather(1, na.view(-1, 1)).squeeze(1)
-                y = rewards + float(gamma) * next_q
-            return F.smooth_l1_loss(chosen_q, y), {"mean_q": float(chosen_q.detach().mean()), "target_q_mean": float(y.detach().mean()), "next_q_mean": float(next_q.detach().mean())}
-        batch["_loss_fn"] = _loss  # type: ignore[index]
     rewards = torch.tensor([t.reward for t in transitions], dtype=torch.float32, device=cache.device)
     dones = torch.tensor([t.done for t in transitions], dtype=torch.bool, device=cache.device)
     return batch, next_batch, rewards, dones
@@ -384,6 +420,8 @@ class NCDMC3DQNTrainer:
 
     def save_checkpoint(self, metrics: dict[str, float], epoch: int) -> None:
         meta = build_checkpoint_metadata(knowledge_dim=self.cache.knowledge_dim, selection_horizon=self.selection_horizon, warm_start_items=1, alpha_fit=self.alpha_fit, reward_config=asdict(self.reward_cfg), model_config=self.model_config, candidate_pool_config={"max_candidates": None, "prefilter_enabled": False, "prefilter_top_k": 256, "prefilter_mode": "diagnostic_heuristic"}, ncdm_item_count=self.cache.ncdm_item_count, q_matrix_item_count=self.cache.q_matrix_item_count, training_seed=self.seed, validation_metrics=metrics, epoch=epoch, strict_item_count_check=self.cache.strict_item_count_check)
+        if isinstance(self.online_net, SetConditionedNCDMQNetwork):
+            meta = build_set_checkpoint_metadata(network=self.online_net, knowledge_dim=self.cache.knowledge_dim, selection_horizon=self.selection_horizon, warm_start_items=1, alpha_fit=self.alpha_fit, reward_config=asdict(self.reward_cfg), model_config=self.model_config, candidate_pool_config={"max_candidates": None, "prefilter_enabled": False, "prefilter_top_k": 256, "prefilter_mode": "diagnostic_heuristic"}, ncdm_item_count=self.cache.ncdm_item_count, q_matrix_item_count=self.cache.q_matrix_item_count, training_seed=self.seed, validation_metrics=metrics, epoch=epoch, strict_item_count_check=self.cache.strict_item_count_check)
         torch.save({"model_state_dict": self.online_net.state_dict(), "metadata": meta}, self.out_dir / "best_checkpoint.pt")
 
     def _write_history(self, rows: list[dict[str, float]]) -> None:
@@ -409,3 +447,18 @@ class NCDMC3DQNTrainer:
 def _mean(xs: Sequence[float]) -> float:
     vals = [float(x) for x in xs if math.isfinite(float(x))]
     return sum(vals) / len(vals) if vals else float("nan")
+
+def build_set_checkpoint_metadata(*, network: SetConditionedNCDMQNetwork, knowledge_dim: int, selection_horizon: int, warm_start_items: int, alpha_fit: dict, reward_config: dict, model_config: dict, candidate_pool_config: dict, ncdm_item_count: int, q_matrix_item_count: int, training_seed: int, validation_metrics: dict, epoch: int, strict_item_count_check: bool = True, requested_amp: bool = False, effective_amp: bool = False) -> dict[str, Any]:
+    meta = build_checkpoint_metadata(knowledge_dim=knowledge_dim, selection_horizon=selection_horizon, warm_start_items=warm_start_items, alpha_fit=alpha_fit, reward_config=reward_config, model_config=model_config, candidate_pool_config=candidate_pool_config, ncdm_item_count=ncdm_item_count, q_matrix_item_count=q_matrix_item_count, training_seed=training_seed, validation_metrics=validation_metrics, epoch=epoch, strict_item_count_check=strict_item_count_check)
+    meta.update({"actor_architecture":"set_conditioned_candidate_attention_dueling_double_dqn","candidate_set_encoder":network.candidate_set_encoder,"num_set_layers":network.num_set_layers,"num_inducing_points":network.num_inducing_points,"set_attention_heads":network.set_attention_heads,"use_relative_features":network.use_relative_features,"relative_feature_names": list(RELATIVE_FEATURE_NAMES) if network.use_relative_features else [],"relative_feature_dim":5 if network.use_relative_features else 0,"set_pool_in_value_head":network.set_pool_in_value_head,"full_attention_max_candidates":network.full_attention_max_candidates,"debug_mode":network.debug_mode,"requested_amp":bool(requested_amp),"effective_amp":bool(effective_amp)})
+    return meta
+
+def load_set_c3dqn_checkpoint(checkpoint_path: str | Path, *, ncdm, q_matrix: torch.Tensor, device: str | torch.device = "cpu", expected_protocol_config: dict[str, Any] | None = None) -> tuple[SetConditionedNCDMQNetwork, dict[str, Any]]:
+    ck=torch.load(Path(checkpoint_path),map_location=device); meta=dict(ck.get("metadata") or {})
+    if meta.get("actor_architecture") != "set_conditioned_candidate_attention_dueling_double_dqn": raise ValueError("not a Set-C3DQN checkpoint")
+    expected=dict(expected_protocol_config or {}); expected.setdefault("q_matrix_item_count",int(q_matrix.shape[0])); expected.setdefault("ncdm_item_count",int(ncdm.k_difficulty.num_embeddings)); expected.setdefault("knowledge_dim",int(q_matrix.shape[1])); validate_c3dqn_checkpoint_metadata(meta, expected)
+    cfg=dict(meta.get("model_config") or {})
+    net=SetConditionedNCDMQNetwork(int(meta["knowledge_dim"]), d_model=int(cfg.get("d_model",64)), n_heads=int(cfg.get("n_heads",4)), num_history_layers=int(cfg.get("num_history_layers",1)), dropout=float(cfg.get("dropout",0.0)), candidate_set_encoder=meta.get("candidate_set_encoder","isab"), num_set_layers=int(meta.get("num_set_layers",1)), num_inducing_points=int(meta.get("num_inducing_points",16)), set_attention_heads=int(meta.get("set_attention_heads",cfg.get("n_heads",4))), use_relative_features=bool(meta.get("use_relative_features",True)), set_pool_in_value_head=bool(meta.get("set_pool_in_value_head",True)), full_attention_max_candidates=int(meta.get("full_attention_max_candidates",128)), debug_mode=bool(meta.get("debug_mode",False))).to(device)
+    state=ck.get("model_state_dict") or ck.get("state_dict")
+    if state is None: raise ValueError("Set-C3DQN checkpoint missing model_state_dict")
+    net.load_state_dict(state, strict=True); net.eval(); return net, meta
