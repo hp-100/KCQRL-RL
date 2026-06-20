@@ -88,7 +88,12 @@ class CandidateConditionedNCDMQNetwork(nn.Module):
         candidate_mask: torch.Tensor,
         global_features: torch.Tensor,
         return_attention: bool = False,
+        coverage_count: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # ``pad_c3dqn_batch`` exposes exact coverage for Set-C3DQN.  Accept and
+        # deliberately ignore it here so legacy Base-C3DQN callers can pass a
+        # shared batch dictionary without changing the Base architecture.
+        del coverage_count
         self._assert_shapes(
             history_features,
             history_mask,
