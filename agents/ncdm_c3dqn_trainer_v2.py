@@ -6,10 +6,13 @@ alpha warm starts, AMP, checkpoint dispatch, and candidate-pool handling.
 """
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Sequence
+import csv
+import math
 import random
 import time
 
@@ -25,8 +28,8 @@ from agents.ncdm_c3dqn_trainer import (
     masked_argmax,
     validate_c3dqn_checkpoint_metadata,
 )
-from evaluation.metrics import auc_score, brier_score, nll_score
-from evaluation.offline_eval import StudentSequence
+from evaluation.metrics import auc_score, brier_score, gini, nll_score
+from evaluation.offline_eval import CATOfflineEvaluator, StudentSequence
 from evaluation.protocol import make_student_split
 from models.ncdm import fit_student_alpha
 from models.ncdm_candidate_features import NCDMItemFeatureCache, pad_c3dqn_batch
@@ -43,6 +46,11 @@ from reward.ncdm_diagnostic_reward import (
 
 BASE_ARCHITECTURE = "candidate_conditioned_attention_dueling_double_dqn"
 SET_ARCHITECTURE = "set_conditioned_candidate_attention_dueling_double_dqn"
+
+
+def _mean(values: Sequence[float]) -> float:
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    return sum(finite) / len(finite) if finite else float("nan")
 
 
 def forward_q_network(
@@ -532,11 +540,15 @@ class NCDMC3DQNTrainer(LegacyNCDMC3DQNTrainer):
             "policy_step": int(policy_step),
             "selected_item_id": int(filtered[0]),
         }
+        feature_start = time.perf_counter()
         batch = pad_c3dqn_batch(
             [row],
             self.cache,
             self.selection_horizon,
             require_exact_coverage=self.is_set_model,
+        )
+        self.time_acc["feature_build_seconds"] += (
+            time.perf_counter() - feature_start
         )
         start_time = time.perf_counter()
         with torch.no_grad():
@@ -555,11 +567,15 @@ class NCDMC3DQNTrainer(LegacyNCDMC3DQNTrainer):
         if len(self.replay) < self.min_replay_size:
             return None
         transitions = self.replay.sample(self.batch_size)
+        feature_start = time.perf_counter()
         batch, next_batch, rewards, dones, indices = transitions_to_batches(
             transitions,
             self.cache,
             self.selection_horizon,
             require_exact_coverage=self.is_set_model,
+        )
+        self.time_acc["feature_build_seconds"] += (
+            time.perf_counter() - feature_start
         )
         self.optim.zero_grad(set_to_none=True)
         amp_context = (
@@ -608,6 +624,9 @@ class NCDMC3DQNTrainer(LegacyNCDMC3DQNTrainer):
             time.perf_counter() - start_time
         )
         stats["td_loss"] = float(loss.detach().item())
+        self.time_acc["update_count"] += 1.0
+        self.time_acc["mean_q_sum"] += float(stats["mean_q"])
+        self.time_acc["target_q_sum"] += float(stats["target_q_mean"])
         return stats
 
     def _run_episode(self, split):
@@ -671,6 +690,7 @@ class NCDMC3DQNTrainer(LegacyNCDMC3DQNTrainer):
                 split.query_responses,
                 self._predict_query(alpha_after, split.query_item_ids),
             )
+            reward_start = time.perf_counter()
             reward = compute_ncdm_diagnostic_reward(
                 before_nll,
                 after_nll,
@@ -679,6 +699,9 @@ class NCDMC3DQNTrainer(LegacyNCDMC3DQNTrainer):
                 self.cache.q_masks[item],
                 before_coverage,
                 self.reward_cfg,
+            )
+            self.time_acc["reward_seconds"] += (
+                time.perf_counter() - reward_start
             )
             components = {
                 "prediction_gain": reward.prediction_gain,
@@ -749,6 +772,144 @@ class NCDMC3DQNTrainer(LegacyNCDMC3DQNTrainer):
             filtered = next_filtered
             summary = next_summary
         return transitions, reward_rows, selected_items, losses
+
+    def train(
+        self,
+        sequences_csv: str | Path,
+        *,
+        epochs: int = 1,
+        train_ratio: float = 0.8,
+        max_students: int | None = None,
+        query_ratio: float = 0.2,
+        min_query_items: int = 2,
+    ) -> list[dict[str, float]]:
+        loader = CATOfflineEvaluator({"assets": {}}, debug=False)
+        sequences = loader._load_sequences(Path(sequences_csv))
+        if max_students:
+            sequences = sequences[: int(max_students)]
+        students = list(sequences)
+        random.Random(self.seed).shuffle(students)
+        split_index = max(1, int(round(len(students) * float(train_ratio))))
+        train_sequences = students[:split_index]
+        validation_sequences = students[split_index:] or students[:1]
+
+        history: list[dict[str, float]] = []
+        best_nll = float("inf")
+        for epoch in range(1, int(epochs) + 1):
+            epoch_start = time.perf_counter()
+            self.time_acc = defaultdict(float)
+            reward_rows: list[dict[str, float]] = []
+            selected_all: list[int] = []
+            losses: list[float] = []
+            for sequence in train_sequences:
+                split, _ = make_student_split(
+                    sequence.student_id,
+                    sequence.item_ids,
+                    sequence.responses,
+                    seed=self.seed + epoch,
+                    valid_count=self.cache.item_count,
+                    query_ratio=query_ratio,
+                    min_query_items=min_query_items,
+                )
+                if not split:
+                    continue
+                _, rewards, selected, episode_losses = self._run_episode(split)
+                reward_rows.extend(rewards)
+                selected_all.extend(selected)
+                losses.extend(episode_losses)
+
+            validation_start = time.perf_counter()
+            validation = self.validate(
+                validation_sequences,
+                seed=self.seed + epoch,
+                query_ratio=query_ratio,
+                min_query_items=min_query_items,
+            )
+            self.time_acc["validation_seconds"] += (
+                time.perf_counter() - validation_start
+            )
+            exposure = Counter(selected_all)
+            update_count = self.time_acc.get("update_count", 0.0)
+            mean_q = (
+                self.time_acc.get("mean_q_sum", 0.0) / update_count
+                if update_count > 0
+                else float("nan")
+            )
+            target_q_mean = (
+                self.time_acc.get("target_q_sum", 0.0) / update_count
+                if update_count > 0
+                else float("nan")
+            )
+            row = {
+                "epoch": epoch,
+                "mean_total_reward": _mean(
+                    [reward["total"] for reward in reward_rows]
+                ),
+                "mean_prediction_reward": _mean(
+                    [reward["prediction_gain"] for reward in reward_rows]
+                ),
+                "mean_diagnosis_reward": _mean(
+                    [reward["diagnosis_gain"] for reward in reward_rows]
+                ),
+                "mean_coverage_reward": _mean(
+                    [reward["coverage_gain"] for reward in reward_rows]
+                ),
+                "td_loss": _mean(losses),
+                "mean_q": mean_q,
+                "target_q_mean": target_q_mean,
+                "epsilon": self._epsilon(),
+                "replay_size": len(self.replay),
+                "selected_unique_items": len(exposure),
+                "item_exposure_gini": gini(exposure.values()),
+                **validation,
+                "feature_build_seconds": self.time_acc.get(
+                    "feature_build_seconds",
+                    0.0,
+                ),
+                "alpha_fit_seconds": self.time_acc.get(
+                    "alpha_fit_seconds",
+                    0.0,
+                ),
+                "reward_seconds": self.time_acc.get(
+                    "reward_seconds",
+                    0.0,
+                ),
+                "network_forward_seconds": self.time_acc.get(
+                    "network_forward_seconds",
+                    0.0,
+                ),
+                "network_update_seconds": self.time_acc.get(
+                    "network_update_seconds",
+                    0.0,
+                ),
+                "validation_seconds": self.time_acc.get(
+                    "validation_seconds",
+                    0.0,
+                ),
+                "candidate_prefilter_seconds": self.time_acc.get(
+                    "candidate_prefilter_seconds",
+                    0.0,
+                ),
+                "mean_raw_candidate_count": _mean(
+                    [
+                        transition.raw_candidate_count
+                        for transition in self.replay._data
+                    ]
+                ),
+                "mean_filtered_candidate_count": _mean(
+                    [
+                        transition.filtered_candidate_count
+                        for transition in self.replay._data
+                    ]
+                ),
+                "total_epoch_seconds": time.perf_counter() - epoch_start,
+            }
+            history.append(row)
+            self._write_history(history)
+            if row["validation_query_nll"] <= best_nll:
+                best_nll = row["validation_query_nll"]
+                self.save_checkpoint(row, epoch)
+        return history
 
     def validate(
         self,
@@ -836,12 +997,8 @@ class NCDMC3DQNTrainer(LegacyNCDMC3DQNTrainer):
             "validation_query_nll": nll_score(labels, probabilities),
             "validation_query_auc": auc_score(labels, probabilities),
             "validation_query_brier": brier_score(labels, probabilities),
-            "validation_mastery_entropy": (
-                sum(entropies) / len(entropies) if entropies else float("nan")
-            ),
-            "validation_concept_coverage": (
-                sum(coverages) / len(coverages) if coverages else float("nan")
-            ),
+            "validation_mastery_entropy": _mean(entropies),
+            "validation_concept_coverage": _mean(coverages),
         }
 
     def save_checkpoint(self, metrics: dict[str, float], epoch: int) -> None:
@@ -877,3 +1034,12 @@ class NCDMC3DQNTrainer(LegacyNCDMC3DQNTrainer):
             },
             self.out_dir / "best_checkpoint.pt",
         )
+
+    def _write_history(self, rows: list[dict[str, float]]) -> None:
+        with (self.out_dir / "training_history.csv").open(
+            "w",
+            newline="",
+        ) as file:
+            writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
