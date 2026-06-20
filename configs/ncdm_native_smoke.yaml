@@ -1,15 +1,19 @@
-track: ncdm_native
-policies:
-  - Random-NCDM
-  - C3DQN-NCDM
-selection_horizon: 5
-warm_start_items: 1
-requires:
-  - q_matrix
-  - ncdm_checkpoint
-  - test_sequences
-candidate_pool:
-  max_candidates: null
-  prefilter_enabled: false
-  prefilter_top_k: 256
-  prefilter_mode: diagnostic_heuristic
+device: auto
+assets:
+  base_dir: .
+  q_matrix: data/q_matrix.pt
+  ncdm_checkpoint: outputs/ncdm/best.pt
+  test_sequences: data/test_sequences.csv
+benchmark:
+  protocol: benchmark_v2
+  track: ncdm_native
+  policies:
+    - Random-NCDM
+    - C3DQN-NCDM
+  c3dqn_ncdm_checkpoint: outputs/ncdm_c3dqn_real_smoke/best_checkpoint.pt
+  selection_horizon: 5
+  warm_start_items: 1
+  steps: [0, 1, 3, 5]
+  seeds: [42]
+  max_students: 20
+  output_dir: results/ncdm_native_smoke

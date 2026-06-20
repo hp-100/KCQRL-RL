@@ -169,18 +169,21 @@ class CATOfflineEvaluator:
             reader = csv.DictReader(f)
             rows = list(reader)
         sequences: List[StudentSequence] = []
+        grouped: Dict[str, Tuple[List[int], List[float]]] = {}
         for idx, row in enumerate(rows):
-            sid = row.get("student_id") or row.get("user_id") or str(idx)
+            sid = str(row.get("student_id") or row.get("user_id") or idx)
             item_cell = row.get("item_ids") or row.get("exer_ids") or row.get("questions") or row.get("question_ids")
             resp_cell = row.get("responses") or row.get("answers") or row.get("correct")
             if item_cell and resp_cell:
                 items = self._parse_list_cell(item_cell)
                 responses = [float(x) for x in self._parse_list_cell(resp_cell)]
+                if items and len(items) == len(responses):
+                    sequences.append(StudentSequence(sid, items, responses))
             elif {"item_id", "response"}.issubset(row):
-                items = [int(float(row["item_id"]))]
-                responses = [float(row["response"])]
-            else:
-                continue
+                grouped.setdefault(sid, ([], []))
+                grouped[sid][0].append(int(float(row["item_id"])))
+                grouped[sid][1].append(float(row["response"]))
+        for sid, (items, responses) in grouped.items():
             if items and len(items) == len(responses):
                 sequences.append(StudentSequence(sid, items, responses))
         return sequences

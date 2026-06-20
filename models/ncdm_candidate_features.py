@@ -18,12 +18,24 @@ class NCDMFeatureDims:
 
 class NCDMItemFeatureCache:
     """Precomputes q_mask, masked difficulty and normalized discrimination once per item."""
-    def __init__(self, ncdm: OfficialNCDM, q_matrix: torch.Tensor, device: torch.device | str = "cpu") -> None:
+    def __init__(self, ncdm: OfficialNCDM, q_matrix: torch.Tensor, device: torch.device | str = "cpu", *, allow_item_count_intersection: bool = False) -> None:
         self.device = torch.device(device)
         self.q_matrix = q_matrix.float().to(self.device)
         self.knowledge_dim = int(self.q_matrix.shape[1])
         self.dims = NCDMFeatureDims.from_knowledge_dim(self.knowledge_dim)
-        item_count = min(int(self.q_matrix.shape[0]), int(ncdm.k_difficulty.num_embeddings), int(ncdm.e_discrimination.num_embeddings))
+        q_count = int(self.q_matrix.shape[0])
+        ncdm_items = int(ncdm.k_difficulty.num_embeddings)
+        disc_items = int(ncdm.e_discrimination.num_embeddings)
+        if not allow_item_count_intersection and not (q_count == ncdm_items == disc_items):
+            raise ValueError(
+                "strict item count check failed: "
+                f"q_matrix_item_count={q_count}, ncdm_difficulty_items={ncdm_items}, "
+                f"ncdm_discrimination_items={disc_items}"
+            )
+        item_count = min(q_count, ncdm_items, disc_items)
+        self.strict_item_count_check = not allow_item_count_intersection
+        self.q_matrix_item_count = q_count
+        self.ncdm_item_count = ncdm_items
         item_ids = torch.arange(item_count, dtype=torch.long, device=self.device)
         with torch.no_grad():
             q_mask = self.q_matrix[:item_count].clamp(0, 1)
