@@ -113,3 +113,11 @@ NCAT uses item ID embeddings and commonly outputs fixed full-item-bank Q-values.
 * Diagnosis entropy is not true diagnostic accuracy.
 * Large candidate pools may need deterministic prefiltering later.
 * This first version does not include NCAT's correct/incorrect dual-channel contradiction module.
+
+## Efficient Set-C3DQN-NCDM compute protocol
+
+Formal training uses the shared-prefilter Efficient Set-C3DQN-NCDM protocol: a vectorized NCDM diagnostic prefilter first reduces the full real candidate pool, then candidate-history attention and the ISAB candidate-set encoder score only the deterministic filtered pool. Full candidate self-attention is reserved for small ablations and is capped by `full_attention_max_candidates`.
+
+Default smoke and pilot configs use ISAB, one set layer, small inducing-point counts, AMP where CUDA is available, incremental alpha fitting, and disabled large debug tensor retention. Benchmark comparisons between base C3DQN and Set-C3DQN should use either a full-candidate protocol for both methods or the same saved shared-prefilter manifest/protocol for both methods; never compare a full-pool policy to a Top-K-prefiltered policy without labeling the protocol.
+
+The compute profile entry point is `scripts/profile_ncdm_c3dqn_compute.py`; it reports training-step milliseconds, peak memory, parameter count, and candidate count for the required Top-K/ISAB/full-attention cases.

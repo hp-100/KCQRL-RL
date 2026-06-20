@@ -50,7 +50,7 @@ def main() -> None:
         param.requires_grad_(False)
     ncdm.eval()
     cache = NCDMItemFeatureCache(ncdm, q_matrix, device, allow_item_count_intersection=bool(train_cfg.get("allow_item_count_intersection", False)))
-    net_kwargs = {"d_model": int(model_cfg.get("d_model", 64)), "n_heads": int(model_cfg.get("n_heads", 4)), "num_history_layers": int(model_cfg.get("num_history_layers", 1)), "dropout": float(model_cfg.get("dropout", 0.0))}
+    net_kwargs = {"d_model": int(model_cfg.get("d_model", 64)), "n_heads": int(model_cfg.get("n_heads", 4)), "num_history_layers": int(model_cfg.get("num_history_layers", 1)), "dropout": float(model_cfg.get("dropout", 0.0)), "candidate_set_encoder": str(model_cfg.get("candidate_set_encoder", "isab")), "num_set_layers": int(model_cfg.get("num_set_layers", 1)), "num_inducing_points": int(model_cfg.get("num_inducing_points", 16)), "full_attention_max_candidates": int(model_cfg.get("full_attention_max_candidates", 128)), "debug_mode": bool((cfg.get("debug") or {}).get("return_attention", False))}
     online = CandidateConditionedNCDMQNetwork(cache.knowledge_dim, **net_kwargs).to(device)
     target = CandidateConditionedNCDMQNetwork(cache.knowledge_dim, **net_kwargs).to(device)
     trainer = NCDMC3DQNTrainer(
@@ -73,6 +73,11 @@ def main() -> None:
         epsilon_decay_steps=int(train_cfg.get("epsilon_decay_steps", 1000)),
         alpha_fit=dict(cfg.get("alpha_fit") or train_cfg.get("alpha_fit") or {}),
         reward_config=dict(cfg.get("reward") or train_cfg.get("reward") or {}),
+        candidate_pool_config=dict(cfg.get("candidate_pool") or train_cfg.get("candidate_pool") or {}),
+        use_amp=bool(train_cfg.get("use_amp", False)),
+        validate_every_epochs=int(train_cfg.get("validate_every_epochs", 1)),
+        early_stopping_patience=int(train_cfg.get("early_stopping_patience", 0)),
+        early_stopping_min_delta=float(train_cfg.get("early_stopping_min_delta", 0.0)),
         model_config=net_kwargs,
         seed=int(train_cfg.get("seed", 42)),
         ncdm=ncdm,
