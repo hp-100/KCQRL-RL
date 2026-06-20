@@ -8,4 +8,4 @@ from .ddpg_mirt_policy import DDPGMIRTPolicy
 
 from .rdpg_mirt_policy import RDPGMIRTPolicy
 
-from .c3dqn_ncdm_policy import RandomNCDMPolicy, C3DQNNCDMPolicy
+from .c3dqn_ncdm_policy import RandomNCDMPolicy, C3DQNNCDMPolicy, SetC3DQNNCDMPolicy

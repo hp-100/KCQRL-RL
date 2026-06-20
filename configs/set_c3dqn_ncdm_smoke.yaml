@@ -1,0 +1,24 @@
+device: cpu
+knowledge_dim: 8
+synthetic_item_count: 24
+model:
+  architecture: set_c3dqn
+  d_model: 64
+  num_inducing_points: 8
+candidate_pool:
+  prefilter_enabled: true
+  prefilter_top_k: 128
+  diversity_quota: 16
+alpha_fit:
+  initial_steps: 8
+  incremental_steps: 3
+  lr: 0.05
+  early_stop_tol: 0.00001
+  grad_clip: 5.0
+training:
+  epochs: 1
+  max_students: 20
+  selection_horizon: 5
+  batch_size: 8
+  min_replay_size: 4
+  output_dir: outputs/set_c3dqn_ncdm_smoke

@@ -102,6 +102,11 @@ def pad_c3dqn_batch(samples: Sequence[dict], cache: NCDMItemFeatureCache, select
         if int(s["selected_item_id"]) not in cids:
             raise ValueError(f"selected_item_id {s['selected_item_id']} is not in candidate_item_ids")
         cf = cache.candidate(cids); cand[row, :cf.shape[0]] = cf; cand_mask[row, :cf.shape[0]] = True
-        glob[row] = build_global_feature(torch.as_tensor(s["mastery"], device=cache.device), torch.as_tensor(s["coverage"], device=cache.device), int(s["policy_step"]), selection_horizon)
+        exact_cov = s.get("coverage_count")
+        if exact_cov is not None:
+            cov = (torch.as_tensor(exact_cov, device=cache.device).float() / float(selection_horizon)).clamp(0, 1)
+        else:
+            cov = torch.as_tensor(s["coverage"], device=cache.device).float()
+        glob[row] = build_global_feature(torch.as_tensor(s["mastery"], device=cache.device), cov, int(s["policy_step"]), selection_horizon)
         action[row] = cids.index(int(s["selected_item_id"]))
     return {"history_features": hist, "history_mask": hist_mask, "candidate_features": cand, "candidate_mask": cand_mask, "global_features": glob, "action_index": action}

@@ -1,0 +1,24 @@
+device: auto
+knowledge_dim: 16
+synthetic_item_count: 128
+model:
+  architecture: set_c3dqn
+  d_model: 96
+  num_inducing_points: 16
+candidate_pool:
+  prefilter_enabled: true
+  prefilter_top_k: 256
+  diversity_quota: 32
+alpha_fit:
+  initial_steps: 8
+  incremental_steps: 3
+  lr: 0.05
+  early_stop_tol: 0.00001
+  grad_clip: 5.0
+training:
+  epochs: 5
+  max_students: 200
+  selection_horizon: 10
+  batch_size: 16
+  min_replay_size: 16
+  output_dir: outputs/set_c3dqn_ncdm_pilot
