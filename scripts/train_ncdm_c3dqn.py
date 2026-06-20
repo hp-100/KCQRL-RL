@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agents.ncdm_c3dqn_trainer import NCDMC3DQNTrainer
 from models.ncdm import OfficialNCDM, load_q_matrix, safe_load_ncdm_checkpoint
 from models.ncdm_candidate_features import NCDMItemFeatureCache
-from models.ncdm_candidate_q_network import CandidateConditionedNCDMQNetwork
+from models.ncdm_candidate_q_network import CandidateConditionedNCDMQNetwork, SetConditionedNCDMQNetwork
 
 
 def _device(name: str | None) -> torch.device:
@@ -50,9 +50,17 @@ def main() -> None:
         param.requires_grad_(False)
     ncdm.eval()
     cache = NCDMItemFeatureCache(ncdm, q_matrix, device, allow_item_count_intersection=bool(train_cfg.get("allow_item_count_intersection", False)))
-    net_kwargs = {"d_model": int(model_cfg.get("d_model", 64)), "n_heads": int(model_cfg.get("n_heads", 4)), "num_history_layers": int(model_cfg.get("num_history_layers", 1)), "dropout": float(model_cfg.get("dropout", 0.0))}
-    online = CandidateConditionedNCDMQNetwork(cache.knowledge_dim, **net_kwargs).to(device)
-    target = CandidateConditionedNCDMQNetwork(cache.knowledge_dim, **net_kwargs).to(device)
+    def build_q_network(model_cfg, cache):
+        arch = str(model_cfg.get("architecture", "base_c3dqn"))
+        net_kwargs = {"d_model": int(model_cfg.get("d_model", 64)), "n_heads": int(model_cfg.get("n_heads", 4)), "num_history_layers": int(model_cfg.get("num_history_layers", 1)), "dropout": float(model_cfg.get("dropout", 0.0))}
+        if arch == "base_c3dqn":
+            return CandidateConditionedNCDMQNetwork(cache.knowledge_dim, **net_kwargs), net_kwargs
+        if arch == "set_c3dqn":
+            set_kwargs = {**net_kwargs, "candidate_set_encoder": model_cfg.get("candidate_set_encoder", "isab"), "num_set_layers": int(model_cfg.get("num_set_layers", 1)), "num_inducing_points": int(model_cfg.get("num_inducing_points", 8)), "set_attention_heads": int(model_cfg.get("set_attention_heads", net_kwargs["n_heads"])), "use_relative_features": bool(model_cfg.get("use_relative_features", True)), "set_pool_in_value_head": bool(model_cfg.get("set_pool_in_value_head", True)), "full_attention_max_candidates": int(model_cfg.get("full_attention_max_candidates", 128)), "debug_mode": bool(model_cfg.get("debug_mode", False))}
+            return SetConditionedNCDMQNetwork(cache.knowledge_dim, **set_kwargs), set_kwargs
+        raise ValueError(f"unknown model architecture: {arch}")
+    online, net_kwargs = build_q_network(model_cfg, cache); online = online.to(device)
+    target, _ = build_q_network(model_cfg, cache); target = target.to(device)
     trainer = NCDMC3DQNTrainer(
         online,
         target,
@@ -73,7 +81,9 @@ def main() -> None:
         epsilon_decay_steps=int(train_cfg.get("epsilon_decay_steps", 1000)),
         alpha_fit=dict(cfg.get("alpha_fit") or train_cfg.get("alpha_fit") or {}),
         reward_config=dict(cfg.get("reward") or train_cfg.get("reward") or {}),
-        model_config=net_kwargs,
+        model_config={"architecture": model_cfg.get("architecture", "base_c3dqn"), **net_kwargs},
+        candidate_pool_config=dict(cfg.get("candidate_pool") or train_cfg.get("candidate_pool") or {}),
+        use_amp=bool(train_cfg.get("use_amp", False)),
         seed=int(train_cfg.get("seed", 42)),
         ncdm=ncdm,
         q_matrix=q_matrix,
