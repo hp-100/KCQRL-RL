@@ -24,13 +24,23 @@ training:
   epsilon_end: 0.05
   epsilon_decay_steps: 100
   allow_item_count_intersection: false
+  use_amp: true
 synthetic_item_count: 16
 knowledge_dim: 36
 model:
+  architecture: set_c3dqn
+  candidate_set_encoder: isab
   d_model: 64
   n_heads: 4
   num_history_layers: 1
   dropout: 0.0
+  num_set_layers: 1
+  num_inducing_points: 8
+  set_attention_heads: 4
+  use_relative_features: true
+  set_pool_in_value_head: true
+  full_attention_max_candidates: 128
+  debug_mode: false
 alpha_fit:
   steps: 8
   lr: 0.05
@@ -42,3 +52,14 @@ reward:
   coverage_weight: 0.05
   prediction_scale: 10.0
   reward_clip: 5.0
+
+candidate_pool:
+  prefilter_enabled: true
+  prefilter_top_k: 128
+  diversity_quota: 16
+  weights:
+    uncertainty: 0.35
+    weakness: 0.25
+    novelty: 0.15
+    difficulty: 0.15
+    discrimination: 0.10
