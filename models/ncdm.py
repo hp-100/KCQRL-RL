@@ -87,28 +87,63 @@ def safe_load_ncdm_checkpoint(model: OfficialNCDM, path: str | Path, device: tor
     return list(incompatible.missing_keys), list(incompatible.unexpected_keys)
 
 
-def fit_student_alpha(model: OfficialNCDM, q_matrix: torch.Tensor, history_i: Sequence[int], history_r: Sequence[float], *, steps: int = 8, lr: float = 0.05, device=None) -> torch.Tensor:
-    device = device or q_matrix.device
-    if len(history_i) == 0:
-        return torch.zeros((1, model.knowledge_dim), device=device)
-    items = torch.tensor(history_i, dtype=torch.long, device=device)
-    responses = torch.tensor(history_r, dtype=torch.float32, device=device)
-    with torch.no_grad():
-        mean_diff = torch.sigmoid(model.k_difficulty(items)).mean(dim=0).clamp(1e-4, 1 - 1e-4)
-        init = torch.log(mean_diff / (1.0 - mean_diff))
-    alpha = init.unsqueeze(0).detach().clone().requires_grad_(True)
-    opt = optim.Adam([alpha], lr=lr)
+def fit_student_alpha(
+    model: OfficialNCDM,
+    q_matrix: torch.Tensor,
+    history_i: Sequence[int],
+    history_r: Sequence[float],
+    *,
+    steps: int = 8,
+    lr: float = 0.05,
+    early_stop_tol: float = 1.0e-5,
+    grad_clip: float | None = None,
+    initial_alpha: torch.Tensor | None = None,
+    device=None,
+) -> torch.Tensor:
+    """Fit a per-student NCDM alpha with frozen NCDM parameters."""
+    device = torch.device(device or q_matrix.device)
+    if len(history_i) != len(history_r):
+        raise ValueError("history_i/history_r lengths differ")
     for param in model.parameters():
         param.requires_grad_(False)
     model.eval()
-    for step_idx in range(steps):
+    q_matrix = q_matrix.to(device).float()
+    if initial_alpha is not None:
+        alpha0 = initial_alpha.detach().to(device).float().view(1, model.knowledge_dim)
+        if not torch.isfinite(alpha0).all():
+            raise ValueError("initial_alpha contains non-finite values")
+    elif len(history_i) == 0:
+        alpha0 = torch.zeros((1, model.knowledge_dim), device=device)
+    else:
+        items0 = torch.tensor(history_i, dtype=torch.long, device=device)
+        with torch.no_grad():
+            mean_diff = torch.sigmoid(model.k_difficulty(items0)).mean(dim=0).clamp(1e-4, 1 - 1e-4)
+            alpha0 = torch.log(mean_diff / (1.0 - mean_diff)).view(1, -1)
+    if len(history_i) == 0 or int(steps) <= 0:
+        return alpha0.detach()
+    items = torch.tensor(history_i, dtype=torch.long, device=device)
+    responses = torch.tensor(history_r, dtype=torch.float32, device=device)
+    if not torch.isfinite(responses).all():
+        raise ValueError("history responses contain non-finite values")
+    alpha = alpha0.detach().clone().requires_grad_(True)
+    opt = optim.Adam([alpha], lr=float(lr))
+    prev_loss: float | None = None
+    for _ in range(int(steps)):
         opt.zero_grad()
-        loss = nn.BCELoss()(model.predict_with_alpha(alpha, items, q_matrix), responses)
+        pred = model.predict_with_alpha(alpha, items, q_matrix)
+        if not torch.isfinite(pred).all():
+            raise ValueError("NCDM alpha fit produced non-finite predictions")
+        loss = nn.BCELoss()(pred, responses)
+        if not torch.isfinite(loss):
+            raise ValueError("NCDM alpha fit produced non-finite loss")
         loss.backward()
+        if grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_([alpha], float(grad_clip))
         opt.step()
-        if step_idx >= 5 and loss.item() < 1e-3:
+        cur = float(loss.detach().item())
+        if prev_loss is not None and abs(prev_loss - cur) <= float(early_stop_tol):
             break
-    model.eval()
+        prev_loss = cur
     return alpha.detach()
 
 

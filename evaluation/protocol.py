@@ -62,6 +62,11 @@ def selection_horizon_from_config(config: Mapping | dict, *, default: int | None
 
 
 def valid_item_count(q_matrix, item_bank=None, ncdm=None, mirt=None, *, track: str | None = None) -> int:
+    if track == "ncdm_native":
+        counts = [len(q_matrix)]
+        if ncdm is not None:
+            counts.extend([ncdm.k_difficulty.num_embeddings, ncdm.e_discrimination.num_embeddings])
+        return min(int(c) for c in counts)
     if track == "mirt_native":
         if mirt is None:
             raise ValueError("mirt_native valid_item_count requires a MIRT model")
