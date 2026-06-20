@@ -3,10 +3,12 @@ from __future__ import annotations
 
 from pathlib import Path
 import argparse
+import time
 
 import torch
 import yaml
 
+from agents.ncdm_c3dqn_trainer import C3DQNTransition
 from agents.ncdm_c3dqn_trainer_v2 import NCDMC3DQNTrainer
 from models.ncdm import OfficialNCDM, load_q_matrix, safe_load_ncdm_checkpoint
 from models.ncdm_candidate_features import NCDMItemFeatureCache
@@ -111,19 +113,86 @@ def build_trainer_from_config(cfg: dict, *, synthetic_smoke: bool = False):
     return trainer, ncdm, q_matrix, paths
 
 
+def run_synthetic_smoke(trainer: NCDMC3DQNTrainer) -> dict[str, float]:
+    start = time.perf_counter()
+    knowledge_dim = trainer.cache.knowledge_dim
+    candidate_ids = list(range(1, min(trainer.cache.item_count, 7)))
+    if len(candidate_ids) < 2:
+        raise ValueError("synthetic smoke requires at least three cached items")
+    for sample_index in range(max(8, trainer.min_replay_size)):
+        selected = candidate_ids[sample_index % len(candidate_ids)]
+        next_candidates = [item for item in candidate_ids if item != selected]
+        current_count = [0.0] * knowledge_dim
+        next_count = [1.0 if index == 0 else 0.0 for index in range(knowledge_dim)]
+        trainer.replay.push(
+            C3DQNTransition(
+                history_item_ids=[0],
+                history_responses=[1.0],
+                candidate_item_ids=list(candidate_ids),
+                mastery=[0.5] * knowledge_dim,
+                coverage=[0.0] * knowledge_dim,
+                policy_step=0,
+                selected_item_id=selected,
+                reward=0.1,
+                reward_components={"prediction_gain": 0.1, "diagnosis_gain": 0.0, "coverage_gain": 0.0, "total": 0.1},
+                next_history_item_ids=[0, selected],
+                next_history_responses=[1.0, 1.0],
+                next_candidate_item_ids=next_candidates,
+                next_mastery=[0.55] * knowledge_dim,
+                next_coverage=[value / max(1, trainer.selection_horizon) for value in next_count],
+                next_policy_step=1,
+                done=False,
+                coverage_count=current_count,
+                next_coverage_count=next_count,
+                raw_candidate_count=len(candidate_ids),
+                filtered_candidate_count=len(candidate_ids),
+            )
+        )
+    stats = trainer.update_once() or {"td_loss": 0.0, "mean_q": 0.0, "target_q_mean": 0.0}
+    metrics = {
+        "epoch": 1,
+        "mean_total_reward": 0.1,
+        "mean_prediction_reward": 0.1,
+        "mean_diagnosis_reward": 0.0,
+        "mean_coverage_reward": 0.0,
+        "td_loss": stats["td_loss"],
+        "mean_q": stats.get("mean_q", 0.0),
+        "target_q_mean": stats.get("target_q_mean", 0.0),
+        "epsilon": 0.0,
+        "replay_size": len(trainer.replay),
+        "selected_unique_items": len(candidate_ids),
+        "item_exposure_gini": 0.0,
+        "validation_query_nll": 0.0,
+        "validation_query_auc": 0.5,
+        "validation_query_brier": 0.25,
+        "validation_mastery_entropy": 1.0,
+        "validation_concept_coverage": 0.0,
+        "feature_build_seconds": 0.0,
+        "alpha_fit_seconds": 0.0,
+        "reward_seconds": 0.0,
+        "network_forward_seconds": 0.0,
+        "network_update_seconds": trainer.time_acc.get("network_update_seconds", 0.0),
+        "validation_seconds": 0.0,
+        "candidate_prefilter_seconds": 0.0,
+        "mean_raw_candidate_count": float(len(candidate_ids)),
+        "mean_filtered_candidate_count": float(len(candidate_ids)),
+        "total_epoch_seconds": time.perf_counter() - start,
+    }
+    trainer._write_history([metrics])
+    trainer.save_checkpoint(metrics, 1)
+    return metrics
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train C3DQN-NCDM")
     parser.add_argument("--config", default="configs/ncdm_c3dqn_smoke.yaml")
     parser.add_argument("--synthetic-smoke", action="store_true")
     args = parser.parse_args()
     cfg = yaml.safe_load(Path(args.config).read_text())
-    trainer, _ncdm, _q_matrix, paths = build_trainer_from_config(
-        cfg,
-        synthetic_smoke=args.synthetic_smoke,
-    )
+    trainer, _ncdm, _q_matrix, paths = build_trainer_from_config(cfg, synthetic_smoke=args.synthetic_smoke)
     train_cfg = dict(cfg.get("training") or {})
     if args.synthetic_smoke:
-        metrics = trainer.run_synthetic_smoke_epoch()
+        metrics = run_synthetic_smoke(trainer)
     else:
         history = trainer.train(
             paths["train_valid_sequences"],
