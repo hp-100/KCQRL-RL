@@ -21,6 +21,8 @@ from evaluation.protocol import make_student_split, valid_item_count
 from models.ncdm import fit_student_alpha
 from models.ncdm_candidate_features import NCDMItemFeatureCache, pad_c3dqn_batch
 from models.ncdm_candidate_q_network import CandidateConditionedNCDMQNetwork
+from models.set_ncdm_candidate_q_network import SetConditionedNCDMQNetwork, RELATIVE_FEATURE_NAMES
+from models.ncdm_candidate_prefilter import NCDMCandidatePrefilter
 from reward.ncdm_diagnostic_reward import NCDMDiagnosticRewardConfig, compute_ncdm_diagnostic_reward, mastery_entropy
 
 
@@ -101,17 +103,20 @@ def compute_double_dqn_loss(
     dones: torch.Tensor,
     gamma: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    q_values, _ = online_net(batch["history_features"], batch["history_mask"], batch["candidate_features"], batch["candidate_mask"], batch["global_features"])
+    extra = {"coverage_count": batch["coverage_count"]} if isinstance(online_net, SetConditionedNCDMQNetwork) else {}
+    q_values, _ = online_net(batch["history_features"], batch["history_mask"], batch["candidate_features"], batch["candidate_mask"], batch["global_features"], **extra)
     chosen_q = q_values.gather(1, batch["action_index"].view(-1, 1)).squeeze(1)
     with torch.no_grad():
         next_q = torch.zeros_like(rewards)
         next_action_mean = 0.0
         non_terminal = ~dones.bool()
         if next_batch is not None and non_terminal.any():
-            next_online_q, _ = online_net(next_batch["history_features"], next_batch["history_mask"], next_batch["candidate_features"], next_batch["candidate_mask"], next_batch["global_features"])
+            extra_next = {"coverage_count": next_batch["coverage_count"]} if isinstance(online_net, SetConditionedNCDMQNetwork) else {}
+            next_online_q, _ = online_net(next_batch["history_features"], next_batch["history_mask"], next_batch["candidate_features"], next_batch["candidate_mask"], next_batch["global_features"], **extra_next)
             next_action = masked_argmax(next_online_q, next_batch["candidate_mask"])
             next_action_mean = float(next_action.float().mean().item())
-            next_target_q, _ = target_net(next_batch["history_features"], next_batch["history_mask"], next_batch["candidate_features"], next_batch["candidate_mask"], next_batch["global_features"])
+            target_extra = {"coverage_count": next_batch["coverage_count"]} if isinstance(target_net, SetConditionedNCDMQNetwork) else {}
+            next_target_q, _ = target_net(next_batch["history_features"], next_batch["history_mask"], next_batch["candidate_features"], next_batch["candidate_mask"], next_batch["global_features"], **target_extra)
             next_q[non_terminal] = next_target_q.gather(1, next_action.view(-1, 1)).squeeze(1)
         target = rewards + float(gamma) * next_q
     loss = F.smooth_l1_loss(chosen_q, target)
@@ -169,6 +174,8 @@ def load_c3dqn_checkpoint(checkpoint_path: str | Path, *, ncdm, q_matrix: torch.
     meta = dict(ck.get("metadata") or {})
     if not meta:
         raise ValueError("C3DQN checkpoint missing metadata")
+    if meta.get("actor_architecture", "candidate_conditioned_attention_dueling_double_dqn") != "candidate_conditioned_attention_dueling_double_dqn":
+        raise ValueError("C3DQN checkpoint architecture mismatch")
     expected = dict(expected_protocol_config or {})
     expected.setdefault("q_matrix_item_count", int(q_matrix.shape[0]))
     expected.setdefault("ncdm_item_count", int(ncdm.k_difficulty.num_embeddings))
@@ -409,3 +416,25 @@ class NCDMC3DQNTrainer:
 def _mean(xs: Sequence[float]) -> float:
     vals = [float(x) for x in xs if math.isfinite(float(x))]
     return sum(vals) / len(vals) if vals else float("nan")
+
+SET_ARCHITECTURE = "set_conditioned_candidate_attention_dueling_double_dqn"
+BASE_ARCHITECTURE = "candidate_conditioned_attention_dueling_double_dqn"
+
+def build_set_checkpoint_metadata(*, knowledge_dim:int, selection_horizon:int, warm_start_items:int, alpha_fit:dict, reward_config:dict, model_config:dict, candidate_pool_config:dict, ncdm_item_count:int, q_matrix_item_count:int, training_seed:int=0, validation_metrics:dict|None=None, epoch:int=0, strict_item_count_check:bool=True)->dict[str,Any]:
+    meta=build_checkpoint_metadata(knowledge_dim=knowledge_dim,selection_horizon=selection_horizon,warm_start_items=warm_start_items,alpha_fit=alpha_fit,reward_config=reward_config,model_config=model_config,candidate_pool_config=candidate_pool_config,ncdm_item_count=ncdm_item_count,q_matrix_item_count=q_matrix_item_count,training_seed=training_seed,validation_metrics=validation_metrics or {},epoch=epoch,strict_item_count_check=strict_item_count_check)
+    cfg=dict(model_config)
+    meta.update({"actor_architecture":SET_ARCHITECTURE,"candidate_set_encoder":cfg["candidate_set_encoder"],"num_set_layers":int(cfg.get("num_set_layers",1)),"num_inducing_points":int(cfg.get("num_inducing_points",16)),"set_attention_heads":int(cfg.get("set_attention_heads",cfg.get("n_heads",4))),"relative_feature_names":list(RELATIVE_FEATURE_NAMES),"relative_feature_dim":5 if cfg.get("use_relative_features",True) else 0,"set_pool_in_value_head":bool(cfg.get("set_pool_in_value_head",True)),"full_attention_max_candidates":int(cfg.get("full_attention_max_candidates",128))})
+    return meta
+
+def load_set_c3dqn_checkpoint(checkpoint_path: str|Path, *, ncdm, q_matrix:torch.Tensor, device: str|torch.device="cpu", expected_protocol_config:dict[str,Any]|None=None):
+    ck=torch.load(Path(checkpoint_path),map_location=device); meta=dict(ck.get("metadata") or {})
+    if meta.get("actor_architecture") != SET_ARCHITECTURE: raise ValueError("Set-C3DQN checkpoint architecture mismatch")
+    required=["candidate_set_encoder","num_set_layers","num_inducing_points","set_attention_heads","relative_feature_dim","set_pool_in_value_head","full_attention_max_candidates"]
+    missing=[k for k in required if k not in meta]
+    if missing: raise ValueError(f"Set-C3DQN checkpoint missing metadata fields: {missing}")
+    expected=dict(expected_protocol_config or {}); expected.setdefault("q_matrix_item_count",int(q_matrix.shape[0])); expected.setdefault("ncdm_item_count",int(ncdm.k_difficulty.num_embeddings)); expected.setdefault("knowledge_dim",int(q_matrix.shape[1]))
+    validate_c3dqn_checkpoint_metadata(meta, expected)
+    cfg=dict(meta.get("model_config") or {})
+    net=SetConditionedNCDMQNetwork(int(meta["knowledge_dim"]), d_model=int(cfg.get("d_model",64)), n_heads=int(cfg.get("n_heads",4)), num_history_layers=int(cfg.get("num_history_layers",1)), dropout=float(cfg.get("dropout",0.0)), candidate_set_encoder=meta["candidate_set_encoder"], num_set_layers=int(meta["num_set_layers"]), num_inducing_points=int(meta["num_inducing_points"]), set_attention_heads=int(meta["set_attention_heads"]), use_relative_features=int(meta["relative_feature_dim"])>0, set_pool_in_value_head=bool(meta["set_pool_in_value_head"]), full_attention_max_candidates=int(meta["full_attention_max_candidates"])).to(device)
+    state=ck.get("model_state_dict") or ck.get("state_dict")
+    net.load_state_dict(state, strict=True); net.eval(); return net, meta

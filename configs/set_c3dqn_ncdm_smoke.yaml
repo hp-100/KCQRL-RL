@@ -1,0 +1,20 @@
+model:
+  architecture: set_c3dqn
+  d_model: 64
+  n_heads: 4
+  num_history_layers: 1
+  candidate_set_encoder: isab
+  num_set_layers: 1
+  num_inducing_points: 8
+  set_pool_in_value_head: true
+  use_relative_features: true
+candidate_pool:
+  prefilter_enabled: true
+  prefilter_top_k: 128
+training:
+  batch_size: 8
+  use_amp: true
+alpha_fit:
+  initial_steps: 8
+  incremental_steps: 3
+  lr: 0.05
