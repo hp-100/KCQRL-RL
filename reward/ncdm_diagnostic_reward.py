@@ -29,12 +29,13 @@ SUPPORTED_REWARD_MODES = {
 
 @dataclass(frozen=True)
 class NCDMDiagnosticRewardConfig:
-    mode: str = "legacy"
+    # Keep the original numeric field order for positional-call compatibility.
     prediction_weight: float = 1.0
     diagnosis_weight: float = 0.2
     coverage_weight: float = 0.05
     prediction_scale: float = 10.0
     reward_clip: float = 5.0
+    mode: str = "legacy"
 
     def __post_init__(self) -> None:
         if self.mode not in SUPPORTED_REWARD_MODES:
