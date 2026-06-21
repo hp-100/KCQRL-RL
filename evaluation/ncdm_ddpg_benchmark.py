@@ -88,11 +88,14 @@ class NCDMDDPGBenchmarkEvaluator(BenchmarkV2Evaluator):
         required_keys = ["q_matrix", "ncdm_checkpoint", "test_sequences"]
         if "NCDM-DDPG" in self.policy_names:
             required_keys.append("item_bank")
-        missing = [
-            paths[key]
-            for key in required_keys
-            if key not in paths or not paths[key].exists()
-        ]
+
+        missing: list[Path] = []
+        for key in required_keys:
+            path = paths.get(key)
+            if path is None:
+                missing.append(Path(f"assets.{key}"))
+            elif not path.exists():
+                missing.append(path)
         if missing:
             raise MissingAssetsError(missing)
 
