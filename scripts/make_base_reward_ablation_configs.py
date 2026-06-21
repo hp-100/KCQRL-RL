@@ -9,9 +9,14 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 from pathlib import Path
+import sys
 from typing import Iterable
 
 import yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.make_c3dqn_topk64_configs import build_paired_configs
 
@@ -129,7 +134,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--top-k", type=int, default=64)
-    parser.add_argument("--experiments", type=_parse_csv, default=["prediction", "prediction_coverage"])
+    parser.add_argument(
+        "--experiments",
+        type=_parse_csv,
+        default=["prediction", "prediction_coverage"],
+    )
     parser.add_argument("--no-amp", action="store_true")
     args = parser.parse_args()
 
@@ -147,7 +156,11 @@ def main() -> None:
         top_k=args.top_k,
         experiments=args.experiments,
     )
-    for path in write_reward_ablation_configs(configs, args.config_root, args.seed).values():
+    for path in write_reward_ablation_configs(
+        configs,
+        args.config_root,
+        args.seed,
+    ).values():
         print(path)
 
 
