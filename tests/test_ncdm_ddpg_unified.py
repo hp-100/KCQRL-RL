@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from evaluation.policies.ddpg_policy import (
+    NCDMDDPGDiversePolicy,
     NCDMDDPGPolicy,
     load_lstm_actor_checkpoint,
 )
@@ -94,6 +95,51 @@ def test_ncdm_ddpg_rejects_privileged_context(tmp_path: Path) -> None:
             [1.0],
             {"query_item_ids": [2]},
         )
+
+
+def test_diverse_ddpg_uses_exposure_to_break_repeated_nearest_neighbor(
+    tmp_path: Path,
+) -> None:
+    q_matrix = torch.tensor(
+        [
+            [1.0, 1.0],
+            [0.0, 1.0],
+            [0.0, 1.0],
+        ]
+    )
+    item_bank = torch.ones((3, 4))
+    policy = NCDMDDPGDiversePolicy(
+        tmp_path / "unused.pt",
+        actor=FixedIdealActor(),
+        q_matrix=q_matrix,
+        item_bank=item_bank,
+        ncdm=TinyNCDM(3, 2),
+        device="cpu",
+        top_k=2,
+        exposure_weight=1.0,
+        novelty_weight=0.0,
+        coverage_weight=0.0,
+    )
+
+    policy.reset("student-a", 101, {})
+    first = policy.select(
+        [1, 2],
+        [0],
+        [1.0],
+        {"policy_step": 0, "selection_horizon": 10},
+    )
+    policy.reset("student-b", 101, {})
+    second = policy.select(
+        [1, 2],
+        [0],
+        [1.0],
+        {"policy_step": 0, "selection_horizon": 10},
+    )
+
+    assert first == 1
+    assert second == 2
+    assert policy.global_exposure[1] == 1
+    assert policy.global_exposure[2] == 1
 
 
 def test_lstm_actor_loader_accepts_raw_and_wrapped_state_dicts(tmp_path: Path) -> None:
