@@ -54,6 +54,25 @@ def release_memory() -> None:
         torch.cuda.empty_cache()
 
 
+def checkpoint_selection_horizon(checkpoint: Path) -> int:
+    payload = torch.load(checkpoint, map_location="cpu")
+    try:
+        metadata = dict(payload.get("metadata") or {})
+        if "selection_horizon" not in metadata:
+            raise ValueError(
+                f"C3DQN checkpoint missing selection_horizon metadata: {checkpoint}"
+            )
+        horizon = int(metadata["selection_horizon"])
+    finally:
+        del payload
+        release_memory()
+    if horizon <= 0:
+        raise ValueError(
+            f"invalid selection_horizon={horizon} in checkpoint: {checkpoint}"
+        )
+    return horizon
+
+
 def run_stage(
     *,
     config: dict,
@@ -162,6 +181,17 @@ def main() -> None:
         drive_root,
         args.c3dqn_checkpoints,
     )
+    checkpoint_horizons = {
+        checkpoint: checkpoint_selection_horizon(checkpoint)
+        for checkpoint in c3dqn_checkpoints
+    }
+    for checkpoint, horizon in checkpoint_horizons.items():
+        if max(args.steps) > horizon:
+            raise ValueError(
+                f"requested step {max(args.steps)} exceeds checkpoint "
+                f"selection_horizon={horizon}: {checkpoint}"
+            )
+
     output_root = (
         args.output_root.expanduser().resolve()
         if args.output_root is not None
@@ -173,7 +203,7 @@ def main() -> None:
     print("independent test sequences:", test_sequences)
     print("Base-C3DQN checkpoints:")
     for checkpoint in c3dqn_checkpoints:
-        print("  ", checkpoint)
+        print("  ", checkpoint, "selection_horizon=", checkpoint_horizons[checkpoint])
 
     all_rows: list[dict] = []
 
@@ -189,6 +219,7 @@ def main() -> None:
             steps=args.steps,
             max_students=args.max_students,
         )
+        config["benchmark"]["selection_horizon"] = max(args.steps)
         config["benchmark"]["save_predictions"] = False
         config["benchmark"]["save_traces"] = False
         rows = run_stage(
@@ -208,6 +239,7 @@ def main() -> None:
     # Each Base-C3DQN training seed is evaluated separately.
     for checkpoint in c3dqn_checkpoints:
         training_run = checkpoint.parent.name
+        checkpoint_horizon = checkpoint_horizons[checkpoint]
         for eval_seed in args.eval_seeds:
             stage_dir = (
                 output_root
@@ -222,6 +254,7 @@ def main() -> None:
                 steps=args.steps,
                 max_students=args.max_students,
             )
+            config["benchmark"]["selection_horizon"] = checkpoint_horizon
             config["benchmark"]["save_predictions"] = False
             config["benchmark"]["save_traces"] = False
             rows = run_stage(
@@ -249,6 +282,10 @@ def main() -> None:
             {
                 "ddpg_checkpoint": str(ddpg_checkpoint),
                 "c3dqn_checkpoints": [str(path) for path in c3dqn_checkpoints],
+                "c3dqn_selection_horizons": {
+                    str(path): checkpoint_horizons[path]
+                    for path in c3dqn_checkpoints
+                },
                 "test_sequences": str(test_sequences),
                 "eval_seeds": args.eval_seeds,
                 "steps": args.steps,
