@@ -85,9 +85,12 @@ class NCDMDDPGBenchmarkEvaluator(BenchmarkV2Evaluator):
             ddpg_checkpoint=str(self.ddpg_checkpoint),
         )
         paths = legacy.paths
-        required_keys = ["q_matrix", "ncdm_checkpoint", "test_sequences"]
-        if "NCDM-DDPG" in self.policy_names:
-            required_keys.append("item_bank")
+        required_keys = [
+            "q_matrix",
+            "item_bank",
+            "ncdm_checkpoint",
+            "test_sequences",
+        ]
 
         missing: list[Path] = []
         for key in required_keys:
@@ -128,31 +131,31 @@ class NCDMDDPGBenchmarkEvaluator(BenchmarkV2Evaluator):
         for parameter in ncdm.parameters():
             parameter.requires_grad = False
 
-        if "NCDM-DDPG" in self.policy_names:
-            print("loading semantic item bank...", flush=True)
-            item_bank = legacy._load_array(paths["item_bank"]).astype(np.float32)
-        else:
-            item_bank = np.zeros((0, 0), dtype=np.float32)
+        # Always load the semantic bank in this specialized evaluator, including
+        # C3DQN-only stages. This guarantees Random, NCDM-DDPG and every C3DQN
+        # checkpoint are evaluated on exactly the same item-ID universe.
+        print("loading semantic item bank...", flush=True)
+        item_bank = legacy._load_array(paths["item_bank"]).astype(np.float32)
+        if item_bank.ndim != 2 or item_bank.shape[1] <= 0:
+            raise ValueError("unified NCDM benchmark requires a rank-2 item bank")
 
         common_items = min(
             int(q.shape[0]),
+            int(item_bank.shape[0]),
             int(ncdm.k_difficulty.num_embeddings),
             int(ncdm.e_discrimination.num_embeddings),
         )
-        if "NCDM-DDPG" in self.policy_names:
-            if item_bank.ndim != 2 or item_bank.shape[1] <= 0:
-                raise ValueError("NCDM-DDPG requires a rank-2 semantic item bank")
-            common_items = min(common_items, int(item_bank.shape[0]))
-            # The base benchmark includes the semantic bank in valid_item_count
-            # for non-native tracks. This gives Random and NCDM-DDPG the same
-            # 0..common_items-1 universe without changing the full Q/NCDM shapes.
-            self.track = "benchmark_v2"
-            print(
-                f"shared NCDM-DDPG item universe: {common_items}",
-                flush=True,
-            )
         if common_items <= 0:
-            raise ValueError("NCDM-DDPG assets have no common valid item IDs")
+            raise ValueError("unified NCDM benchmark has no common valid item IDs")
+
+        # The generic valid_item_count helper includes item_bank only outside the
+        # ncdm_native branch. Prediction still uses NCDM because only mirt_native
+        # triggers the MIRT evaluator path.
+        self.track = "benchmark_v2"
+        print(
+            f"shared unified item universe: {common_items}",
+            flush=True,
+        )
 
         self.mirt_model = None
         return q, item_bank, sequences, ncdm, False
