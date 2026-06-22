@@ -14,7 +14,11 @@ from evaluation.offline_eval import (
     MissingAssetsError,
     StudentSequence,
 )
-from evaluation.policies import NCDMDDPGPolicy
+from evaluation.policies import (
+    NCDMDDPGDiversePolicy,
+    NCDMDDPGPolicy,
+    load_lstm_actor_checkpoint,
+)
 from models.ncdm import OfficialNCDM, safe_load_ncdm_checkpoint
 
 
@@ -162,7 +166,8 @@ class NCDMDDPGBenchmarkEvaluator(BenchmarkV2Evaluator):
 
     def _policies(self, q, item_bank, ncdm, synthetic, mirt=None):
         requested_names = list(self.policy_names)
-        base_names = [name for name in requested_names if name != "NCDM-DDPG"]
+        ddpg_names = {"NCDM-DDPG", "NCDM-DDPG-Diverse"}
+        base_names = [name for name in requested_names if name not in ddpg_names]
         self.policy_names = base_names
         try:
             base_policies = super()._policies(
@@ -175,33 +180,66 @@ class NCDMDDPGBenchmarkEvaluator(BenchmarkV2Evaluator):
         finally:
             self.policy_names = requested_names
 
-        ddpg_policy = None
-        if "NCDM-DDPG" in requested_names:
-            ddpg_policy = NCDMDDPGPolicy(
-                self.ddpg_checkpoint,
-                q_matrix=torch.as_tensor(q, dtype=torch.float32, device=self.device),
-                item_bank=torch.as_tensor(
-                    item_bank,
-                    dtype=torch.float32,
-                    device=self.device,
-                ),
-                ncdm=ncdm,
+        ddpg_policies = {}
+        if ddpg_names & set(requested_names):
+            q_tensor = torch.as_tensor(q, dtype=torch.float32, device=self.device)
+            item_bank_tensor = torch.as_tensor(
+                item_bank,
+                dtype=torch.float32,
                 device=self.device,
-                allow_debug_fallback=self.debug or synthetic,
             )
+            actor = load_lstm_actor_checkpoint(
+                self.ddpg_checkpoint,
+                semantic_dim=int(item_bank_tensor.shape[1]),
+                q_dim=int(q_tensor.shape[1]),
+                device=self.device,
+            )
+            common_kwargs = {
+                "actor": actor,
+                "q_matrix": q_tensor,
+                "item_bank": item_bank_tensor,
+                "ncdm": ncdm,
+                "device": self.device,
+                "allow_debug_fallback": self.debug or synthetic,
+            }
+            if "NCDM-DDPG" in requested_names:
+                ddpg_policies["NCDM-DDPG"] = NCDMDDPGPolicy(
+                    self.ddpg_checkpoint,
+                    **common_kwargs,
+                )
+            if "NCDM-DDPG-Diverse" in requested_names:
+                diversity = dict(
+                    (self.config.get("benchmark") or {}).get("ddpg_diversity")
+                    or {}
+                )
+                ddpg_policies["NCDM-DDPG-Diverse"] = NCDMDDPGDiversePolicy(
+                    self.ddpg_checkpoint,
+                    top_k=int(diversity.get("top_k", 32)),
+                    exposure_weight=float(
+                        diversity.get("exposure_weight", 0.05)
+                    ),
+                    novelty_weight=float(diversity.get("novelty_weight", 0.05)),
+                    coverage_weight=float(diversity.get("coverage_weight", 0.05)),
+                    q_distance_weight=float(
+                        diversity.get("q_distance_weight", 1.0)
+                    ),
+                    difficulty_distance_weight=float(
+                        diversity.get("difficulty_distance_weight", 1.0)
+                    ),
+                    discrimination_distance_weight=float(
+                        diversity.get("discrimination_distance_weight", 1.0)
+                    ),
+                    **common_kwargs,
+                )
 
         by_name = {policy.name: policy for policy in base_policies}
+        by_name.update(ddpg_policies)
         ordered = []
         for name in requested_names:
-            if name == "NCDM-DDPG":
-                if ddpg_policy is None:
-                    raise RuntimeError("failed to construct NCDM-DDPG")
-                ordered.append(ddpg_policy)
-            else:
-                policy = by_name.get(name)
-                if policy is None:
-                    raise RuntimeError(
-                        f"base benchmark did not construct requested policy: {name}"
-                    )
-                ordered.append(policy)
+            policy = by_name.get(name)
+            if policy is None:
+                raise RuntimeError(
+                    f"benchmark did not construct requested policy: {name}"
+                )
+            ordered.append(policy)
         return ordered
