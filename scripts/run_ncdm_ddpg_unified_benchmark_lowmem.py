@@ -167,6 +167,11 @@ def main() -> None:
         action="store_true",
         help="also evaluate the frozen-actor Top-K exposure-aware reranker",
     )
+    parser.add_argument(
+        "--skip-c3dqn",
+        action="store_true",
+        help="run only Random/original DDPG/diverse DDPG shared stages",
+    )
     parser.add_argument("--ddpg-top-k", type=int, default=32)
     parser.add_argument("--ddpg-exposure-weight", type=float, default=0.05)
     parser.add_argument("--ddpg-novelty-weight", type=float, default=0.05)
@@ -197,12 +202,13 @@ def main() -> None:
         checkpoint: checkpoint_selection_horizon(checkpoint)
         for checkpoint in c3dqn_checkpoints
     }
-    for checkpoint, horizon in checkpoint_horizons.items():
-        if max(args.steps) > horizon:
-            raise ValueError(
-                f"requested step {max(args.steps)} exceeds checkpoint "
-                f"selection_horizon={horizon}: {checkpoint}"
-            )
+    if not args.skip_c3dqn:
+        for checkpoint, horizon in checkpoint_horizons.items():
+            if max(args.steps) > horizon:
+                raise ValueError(
+                    f"requested step {max(args.steps)} exceeds checkpoint "
+                    f"selection_horizon={horizon}: {checkpoint}"
+                )
 
     output_root = (
         args.output_root.expanduser().resolve()
@@ -270,40 +276,42 @@ def main() -> None:
         for row in rows:
             all_rows.append({"training_run": "shared", **row})
 
-    # Each Base-C3DQN training seed is evaluated separately.
-    for checkpoint in c3dqn_checkpoints:
-        training_run = checkpoint.parent.name
-        checkpoint_horizon = checkpoint_horizons[checkpoint]
-        for eval_seed in args.eval_seeds:
-            stage_dir = (
-                output_root
-                / f"c3dqn_{training_run}"
-                / f"eval_seed_{eval_seed}"
-            )
-            config = build_config(
-                data_root=data_root,
-                test_sequences=test_sequences,
-                output_dir=stage_dir,
-                eval_seeds=[eval_seed],
-                steps=args.steps,
-                max_students=args.max_students,
-            )
-            config["benchmark"]["selection_horizon"] = checkpoint_horizon
-            config["benchmark"]["save_predictions"] = False
-            config["benchmark"]["save_traces"] = False
-            rows = run_stage(
-                config=config,
-                ddpg_checkpoint=ddpg_checkpoint,
-                c3dqn_checkpoint=checkpoint,
-                eval_seed=eval_seed,
-                max_students=args.max_students,
-                steps=args.steps,
-                output_dir=stage_dir,
-                policies=["C3DQN-NCDM"],
-                force=args.force,
-            )
-            for row in rows:
-                all_rows.append({"training_run": training_run, **row})
+    # Each Base-C3DQN training seed is evaluated separately unless this is a
+    # focused DDPG projection/reranking ablation.
+    if not args.skip_c3dqn:
+        for checkpoint in c3dqn_checkpoints:
+            training_run = checkpoint.parent.name
+            checkpoint_horizon = checkpoint_horizons[checkpoint]
+            for eval_seed in args.eval_seeds:
+                stage_dir = (
+                    output_root
+                    / f"c3dqn_{training_run}"
+                    / f"eval_seed_{eval_seed}"
+                )
+                config = build_config(
+                    data_root=data_root,
+                    test_sequences=test_sequences,
+                    output_dir=stage_dir,
+                    eval_seeds=[eval_seed],
+                    steps=args.steps,
+                    max_students=args.max_students,
+                )
+                config["benchmark"]["selection_horizon"] = checkpoint_horizon
+                config["benchmark"]["save_predictions"] = False
+                config["benchmark"]["save_traces"] = False
+                rows = run_stage(
+                    config=config,
+                    ddpg_checkpoint=ddpg_checkpoint,
+                    c3dqn_checkpoint=checkpoint,
+                    eval_seed=eval_seed,
+                    max_students=args.max_students,
+                    steps=args.steps,
+                    output_dir=stage_dir,
+                    policies=["C3DQN-NCDM"],
+                    force=args.force,
+                )
+                for row in rows:
+                    all_rows.append({"training_run": training_run, **row})
 
     per_seed_path = output_root / "combined_per_seed.csv"
     aggregate_path = output_root / "combined_aggregate.csv"
@@ -325,6 +333,7 @@ def main() -> None:
                 "steps": args.steps,
                 "max_students": args.max_students,
                 "include_diverse_ddpg": args.include_diverse_ddpg,
+                "skip_c3dqn": args.skip_c3dqn,
                 "ddpg_diversity": diversity_config,
                 "combined_per_seed": str(per_seed_path),
                 "combined_aggregate": str(aggregate_path),
