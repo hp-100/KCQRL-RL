@@ -143,6 +143,14 @@ class NCDMDDPGBenchmarkEvaluator(BenchmarkV2Evaluator):
             if item_bank.ndim != 2 or item_bank.shape[1] <= 0:
                 raise ValueError("NCDM-DDPG requires a rank-2 semantic item bank")
             common_items = min(common_items, int(item_bank.shape[0]))
+            # The base benchmark includes the semantic bank in valid_item_count
+            # for non-native tracks. This gives Random and NCDM-DDPG the same
+            # 0..common_items-1 universe without changing the full Q/NCDM shapes.
+            self.track = "benchmark_v2"
+            print(
+                f"shared NCDM-DDPG item universe: {common_items}",
+                flush=True,
+            )
         if common_items <= 0:
             raise ValueError("NCDM-DDPG assets have no common valid item IDs")
 
