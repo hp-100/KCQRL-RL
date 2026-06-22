@@ -165,17 +165,23 @@ def main() -> None:
     parser.add_argument(
         "--include-diverse-ddpg",
         action="store_true",
-        help="also evaluate the frozen-actor Top-K exposure-aware reranker",
+        help="also evaluate the frozen-actor conservative exposure reranker",
     )
     parser.add_argument(
         "--skip-c3dqn",
         action="store_true",
         help="run only Random/original DDPG/diverse DDPG shared stages",
     )
-    parser.add_argument("--ddpg-top-k", type=int, default=32)
-    parser.add_argument("--ddpg-exposure-weight", type=float, default=0.05)
-    parser.add_argument("--ddpg-novelty-weight", type=float, default=0.05)
-    parser.add_argument("--ddpg-coverage-weight", type=float, default=0.05)
+    parser.add_argument("--ddpg-top-k", type=int, default=16)
+    parser.add_argument("--ddpg-exposure-weight", type=float, default=0.005)
+    parser.add_argument("--ddpg-novelty-weight", type=float, default=0.0)
+    parser.add_argument("--ddpg-coverage-weight", type=float, default=0.0)
+    parser.add_argument("--ddpg-distance-margin-ratio", type=float, default=0.02)
+    parser.add_argument(
+        "--ddpg-distance-mode",
+        choices=["euclidean", "block_mse"],
+        default="euclidean",
+    )
     parser.add_argument("--ddpg-q-distance-weight", type=float, default=1.0)
     parser.add_argument("--ddpg-difficulty-distance-weight", type=float, default=1.0)
     parser.add_argument("--ddpg-discrimination-distance-weight", type=float, default=1.0)
@@ -222,6 +228,8 @@ def main() -> None:
         "exposure_weight": args.ddpg_exposure_weight,
         "novelty_weight": args.ddpg_novelty_weight,
         "coverage_weight": args.ddpg_coverage_weight,
+        "distance_margin_ratio": args.ddpg_distance_margin_ratio,
+        "distance_mode": args.ddpg_distance_mode,
         "q_distance_weight": args.ddpg_q_distance_weight,
         "difficulty_distance_weight": args.ddpg_difficulty_distance_weight,
         "discrimination_distance_weight": args.ddpg_discrimination_distance_weight,
@@ -237,7 +245,6 @@ def main() -> None:
 
     all_rows: list[dict] = []
 
-    # Shared baselines are evaluated once per evaluation seed.
     baseline_checkpoint = c3dqn_checkpoints[0]
     shared_group = (
         "shared_baselines_with_diverse"
@@ -276,8 +283,6 @@ def main() -> None:
         for row in rows:
             all_rows.append({"training_run": "shared", **row})
 
-    # Each Base-C3DQN training seed is evaluated separately unless this is a
-    # focused DDPG projection/reranking ablation.
     if not args.skip_c3dqn:
         for checkpoint in c3dqn_checkpoints:
             training_run = checkpoint.parent.name
