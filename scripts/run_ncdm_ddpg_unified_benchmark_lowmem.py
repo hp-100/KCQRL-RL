@@ -162,6 +162,18 @@ def main() -> None:
     parser.add_argument("--max-students", type=int, default=200)
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--include-diverse-ddpg",
+        action="store_true",
+        help="also evaluate the frozen-actor Top-K exposure-aware reranker",
+    )
+    parser.add_argument("--ddpg-top-k", type=int, default=32)
+    parser.add_argument("--ddpg-exposure-weight", type=float, default=0.05)
+    parser.add_argument("--ddpg-novelty-weight", type=float, default=0.05)
+    parser.add_argument("--ddpg-coverage-weight", type=float, default=0.05)
+    parser.add_argument("--ddpg-q-distance-weight", type=float, default=1.0)
+    parser.add_argument("--ddpg-difficulty-distance-weight", type=float, default=1.0)
+    parser.add_argument("--ddpg-discrimination-distance-weight", type=float, default=1.0)
     args = parser.parse_args()
 
     drive_root = Path(args.drive_root).expanduser().resolve()
@@ -199,18 +211,39 @@ def main() -> None:
     )
     output_root.mkdir(parents=True, exist_ok=True)
 
+    diversity_config = {
+        "top_k": args.ddpg_top_k,
+        "exposure_weight": args.ddpg_exposure_weight,
+        "novelty_weight": args.ddpg_novelty_weight,
+        "coverage_weight": args.ddpg_coverage_weight,
+        "q_distance_weight": args.ddpg_q_distance_weight,
+        "difficulty_distance_weight": args.ddpg_difficulty_distance_weight,
+        "discrimination_distance_weight": args.ddpg_discrimination_distance_weight,
+    }
+
     print("NCDM-DDPG actor:", ddpg_checkpoint)
     print("independent test sequences:", test_sequences)
     print("Base-C3DQN checkpoints:")
     for checkpoint in c3dqn_checkpoints:
         print("  ", checkpoint, "selection_horizon=", checkpoint_horizons[checkpoint])
+    if args.include_diverse_ddpg:
+        print("NCDM-DDPG-Diverse config:", diversity_config)
 
     all_rows: list[dict] = []
 
     # Shared baselines are evaluated once per evaluation seed.
     baseline_checkpoint = c3dqn_checkpoints[0]
+    shared_group = (
+        "shared_baselines_with_diverse"
+        if args.include_diverse_ddpg
+        else "shared_baselines"
+    )
+    shared_policies = ["Random-NCDM", "NCDM-DDPG"]
+    if args.include_diverse_ddpg:
+        shared_policies.append("NCDM-DDPG-Diverse")
+
     for eval_seed in args.eval_seeds:
-        stage_dir = output_root / "shared_baselines" / f"eval_seed_{eval_seed}"
+        stage_dir = output_root / shared_group / f"eval_seed_{eval_seed}"
         config = build_config(
             data_root=data_root,
             test_sequences=test_sequences,
@@ -222,6 +255,7 @@ def main() -> None:
         config["benchmark"]["selection_horizon"] = max(args.steps)
         config["benchmark"]["save_predictions"] = False
         config["benchmark"]["save_traces"] = False
+        config["benchmark"]["ddpg_diversity"] = diversity_config
         rows = run_stage(
             config=config,
             ddpg_checkpoint=ddpg_checkpoint,
@@ -230,7 +264,7 @@ def main() -> None:
             max_students=args.max_students,
             steps=args.steps,
             output_dir=stage_dir,
-            policies=["Random-NCDM", "NCDM-DDPG"],
+            policies=shared_policies,
             force=args.force,
         )
         for row in rows:
@@ -290,6 +324,8 @@ def main() -> None:
                 "eval_seeds": args.eval_seeds,
                 "steps": args.steps,
                 "max_students": args.max_students,
+                "include_diverse_ddpg": args.include_diverse_ddpg,
+                "ddpg_diversity": diversity_config,
                 "combined_per_seed": str(per_seed_path),
                 "combined_aggregate": str(aggregate_path),
             },
