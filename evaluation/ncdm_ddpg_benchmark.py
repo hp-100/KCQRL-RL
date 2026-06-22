@@ -135,9 +135,6 @@ class NCDMDDPGBenchmarkEvaluator(BenchmarkV2Evaluator):
         for parameter in ncdm.parameters():
             parameter.requires_grad = False
 
-        # Always load the semantic bank in this specialized evaluator, including
-        # C3DQN-only stages. This guarantees Random, NCDM-DDPG and every C3DQN
-        # checkpoint are evaluated on exactly the same item-ID universe.
         print("loading semantic item bank...", flush=True)
         item_bank = legacy._load_array(paths["item_bank"]).astype(np.float32)
         if item_bank.ndim != 2 or item_bank.shape[1] <= 0:
@@ -152,9 +149,6 @@ class NCDMDDPGBenchmarkEvaluator(BenchmarkV2Evaluator):
         if common_items <= 0:
             raise ValueError("unified NCDM benchmark has no common valid item IDs")
 
-        # The generic valid_item_count helper includes item_bank only outside the
-        # ncdm_native branch. Prediction still uses NCDM because only mirt_native
-        # triggers the MIRT evaluator path.
         self.track = "benchmark_v2"
         print(
             f"shared unified item universe: {common_items}",
@@ -214,12 +208,18 @@ class NCDMDDPGBenchmarkEvaluator(BenchmarkV2Evaluator):
                 )
                 ddpg_policies["NCDM-DDPG-Diverse"] = NCDMDDPGDiversePolicy(
                     self.ddpg_checkpoint,
-                    top_k=int(diversity.get("top_k", 32)),
+                    top_k=int(diversity.get("top_k", 16)),
                     exposure_weight=float(
-                        diversity.get("exposure_weight", 0.05)
+                        diversity.get("exposure_weight", 0.005)
                     ),
-                    novelty_weight=float(diversity.get("novelty_weight", 0.05)),
-                    coverage_weight=float(diversity.get("coverage_weight", 0.05)),
+                    novelty_weight=float(diversity.get("novelty_weight", 0.0)),
+                    coverage_weight=float(diversity.get("coverage_weight", 0.0)),
+                    distance_margin_ratio=float(
+                        diversity.get("distance_margin_ratio", 0.02)
+                    ),
+                    distance_mode=str(
+                        diversity.get("distance_mode", "euclidean")
+                    ),
                     q_distance_weight=float(
                         diversity.get("q_distance_weight", 1.0)
                     ),
