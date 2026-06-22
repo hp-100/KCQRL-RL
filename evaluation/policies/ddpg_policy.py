@@ -241,8 +241,6 @@ class DDPGPolicy(BaseCATPolicy):
             self._processed_responses.append(response)
 
         if ideal is None:
-            # The evaluator should call select once per new response. Replaying the
-            # final event keeps behavior defined for repeated diagnostic calls.
             self.hx = self.cx = None
             self._processed_items = []
             self._processed_responses = []
@@ -330,13 +328,14 @@ class NCDMDDPGPolicy(DDPGPolicy):
 
 
 class NCDMDDPGDiversePolicy(NCDMDDPGPolicy):
-    """Top-K exposure-aware reranker using an existing NCDM-DDPG actor.
+    """Conservative exposure-aware reranker using a frozen DDPG actor.
 
-    The actor remains frozen.  The policy first retrieves the nearest ``top_k``
-    real items using a block-normalized distance, then reranks them with global
-    exposure, within-student novelty and uncovered-concept terms.  Exposure
-    counts persist across students within one benchmark seed and are recreated
-    when the evaluator creates a new policy for the next seed.
+    The default path preserves the actor's original 73D Euclidean geometry.  It
+    only reranks real items that are both in the nearest ``top_k`` set and
+    within a small relative distance margin of the best geometric match.  This
+    prevents the exposure term from replacing a clearly superior actor match.
+    Optional novelty and coverage terms remain available for later ablations,
+    but are disabled by default.
     """
 
     name = "NCDM-DDPG-Diverse"
@@ -345,10 +344,12 @@ class NCDMDDPGDiversePolicy(NCDMDDPGPolicy):
         self,
         checkpoint: str | Path,
         *,
-        top_k: int = 32,
-        exposure_weight: float = 0.05,
-        novelty_weight: float = 0.05,
-        coverage_weight: float = 0.05,
+        top_k: int = 16,
+        exposure_weight: float = 0.005,
+        novelty_weight: float = 0.0,
+        coverage_weight: float = 0.0,
+        distance_margin_ratio: float = 0.02,
+        distance_mode: str = "euclidean",
         q_distance_weight: float = 1.0,
         difficulty_distance_weight: float = 1.0,
         discrimination_distance_weight: float = 1.0,
@@ -359,6 +360,8 @@ class NCDMDDPGDiversePolicy(NCDMDDPGPolicy):
         self.exposure_weight = float(exposure_weight)
         self.novelty_weight = float(novelty_weight)
         self.coverage_weight = float(coverage_weight)
+        self.distance_margin_ratio = float(distance_margin_ratio)
+        self.distance_mode = str(distance_mode)
         self.q_distance_weight = float(q_distance_weight)
         self.difficulty_distance_weight = float(difficulty_distance_weight)
         self.discrimination_distance_weight = float(
@@ -366,6 +369,12 @@ class NCDMDDPGDiversePolicy(NCDMDDPGPolicy):
         )
         if self.top_k <= 0:
             raise ValueError("top_k must be positive")
+        if self.distance_margin_ratio < 0:
+            raise ValueError("distance_margin_ratio must be non-negative")
+        if self.distance_mode not in {"euclidean", "block_mse"}:
+            raise ValueError(
+                "distance_mode must be either 'euclidean' or 'block_mse'"
+            )
         for label, value in {
             "exposure_weight": self.exposure_weight,
             "novelty_weight": self.novelty_weight,
@@ -380,27 +389,33 @@ class NCDMDDPGDiversePolicy(NCDMDDPGPolicy):
         self.global_exposure: Counter[int] = Counter()
         self.metadata = PolicyMetadata(
             name=self.name,
-            implementation="checkpoint_plus_deterministic_reranker",
-            selection_model="lstm_ddpg_topk_exposure_novelty_coverage_reranker",
+            implementation="checkpoint_plus_conservative_reranker",
+            selection_model="lstm_ddpg_topk_margin_exposure_reranker",
             evaluator_model="NCDM",
             uses_query_labels=False,
             uses_privileged_information=False,
             notes=(
                 f"top_k={self.top_k}; exposure={self.exposure_weight}; "
                 f"novelty={self.novelty_weight}; coverage={self.coverage_weight}; "
-                f"distance_weights=({self.q_distance_weight},"
-                f"{self.difficulty_distance_weight},"
-                f"{self.discrimination_distance_weight})"
+                f"distance_mode={self.distance_mode}; "
+                f"margin_ratio={self.distance_margin_ratio}"
             ),
         )
 
-    def _block_distance(
+    def _candidate_distance(
         self,
         ideal: torch.Tensor,
         q_features: torch.Tensor,
         difficulty: torch.Tensor,
         discrimination: torch.Tensor,
     ) -> torch.Tensor:
+        if self.distance_mode == "euclidean":
+            candidate_features = torch.cat(
+                [q_features, difficulty, discrimination],
+                dim=-1,
+            )
+            return torch.cdist(ideal, candidate_features).squeeze(0)
+
         q_dim = int(self.q_matrix.shape[1])
         ideal_q = ideal[:, :q_dim]
         ideal_difficulty = ideal[:, q_dim : 2 * q_dim]
@@ -512,7 +527,7 @@ class NCDMDDPGDiversePolicy(NCDMDDPGPolicy):
             q_features, difficulty, discrimination = self._candidate_feature_blocks(
                 candidate_tensor
             )
-            distance = self._block_distance(
+            distance = self._candidate_distance(
                 ideal,
                 q_features,
                 difficulty,
@@ -523,27 +538,38 @@ class NCDMDDPGDiversePolicy(NCDMDDPGPolicy):
             top_candidates = candidate_tensor[top_indices]
             top_distance = distance[top_indices]
 
+            best_distance = top_distance[0]
+            margin = torch.clamp(
+                torch.abs(best_distance) * self.distance_margin_ratio,
+                min=1e-8,
+            )
+            eligible_mask = top_distance <= best_distance + margin
+            eligible_candidates = top_candidates[eligible_mask]
+            eligible_distance = top_distance[eligible_mask]
+
             exposure_penalty = torch.tensor(
                 [
                     math.log1p(self.global_exposure[int(item)])
-                    for item in top_candidates.detach().cpu().tolist()
+                    for item in eligible_candidates.detach().cpu().tolist()
                 ],
                 dtype=torch.float32,
                 device=self.device,
             )
-            novelty = self._novelty_scores(top_candidates, history_item_ids)
-            coverage_gain = self._coverage_gain_scores(
-                top_candidates,
-                history_item_ids,
-            )
-            score = (
-                -top_distance
-                - self.exposure_weight * exposure_penalty
-                + self.novelty_weight * novelty
-                + self.coverage_weight * coverage_gain
-            )
+            score = -eligible_distance - self.exposure_weight * exposure_penalty
+
+            if self.novelty_weight > 0:
+                score = score + self.novelty_weight * self._novelty_scores(
+                    eligible_candidates,
+                    history_item_ids,
+                )
+            if self.coverage_weight > 0:
+                score = score + self.coverage_weight * self._coverage_gain_scores(
+                    eligible_candidates,
+                    history_item_ids,
+                )
+
             best_local_index = int(torch.argmax(score).item())
-            selected = int(top_candidates[best_local_index].item())
+            selected = int(eligible_candidates[best_local_index].item())
 
         self.global_exposure[selected] += 1
         return selected
