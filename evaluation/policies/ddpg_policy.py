@@ -1,6 +1,8 @@
 """DDPG policies for NCDM-based adaptive item selection."""
 from __future__ import annotations
 
+import math
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -251,13 +253,11 @@ class DDPGPolicy(BaseCATPolicy):
         assert ideal is not None
         return ideal
 
-    def select(
+    def _validate_selection_inputs(
         self,
         candidate_item_ids: Sequence[int],
-        history_item_ids: Sequence[int],
-        history_responses: Sequence[float],
         context: dict[str, Any],
-    ) -> int:
+    ) -> list[int]:
         candidates = [int(item) for item in candidate_item_ids]
         if not candidates:
             raise ValueError(f"{self.name} requires at least one candidate")
@@ -266,8 +266,6 @@ class DDPGPolicy(BaseCATPolicy):
             raise ValueError(
                 f"{self.name} received privileged context keys: {sorted(leaked)}"
             )
-        if self.actor is None:
-            return candidates[0]
         invalid = [
             item for item in candidates if item < 0 or item >= self.valid_item_count
         ]
@@ -275,22 +273,40 @@ class DDPGPolicy(BaseCATPolicy):
             raise ValueError(
                 f"candidate IDs outside common asset bounds: {invalid[:5]}"
             )
+        return candidates
+
+    def _candidate_feature_blocks(
+        self,
+        candidate_tensor: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_features = self.q_matrix[candidate_tensor]
+        difficulty = torch.sigmoid(self.ncdm.k_difficulty(candidate_tensor))
+        discrimination = torch.sigmoid(
+            self.ncdm.e_discrimination(candidate_tensor)
+        )
+        return q_features, difficulty, discrimination
+
+    def select(
+        self,
+        candidate_item_ids: Sequence[int],
+        history_item_ids: Sequence[int],
+        history_responses: Sequence[float],
+        context: dict[str, Any],
+    ) -> int:
+        candidates = self._validate_selection_inputs(candidate_item_ids, context)
+        if self.actor is None:
+            return candidates[0]
 
         with torch.no_grad():
             ideal = self._sync_history(history_item_ids, history_responses)
             candidate_tensor = torch.tensor(
                 candidates, dtype=torch.long, device=self.device
             )
+            q_features, difficulty, discrimination = self._candidate_feature_blocks(
+                candidate_tensor
+            )
             candidate_features = torch.cat(
-                [
-                    self.q_matrix[candidate_tensor],
-                    torch.sigmoid(
-                        self.ncdm.k_difficulty(candidate_tensor)
-                    ),
-                    torch.sigmoid(
-                        self.ncdm.e_discrimination(candidate_tensor)
-                    ),
-                ],
+                [q_features, difficulty, discrimination],
                 dim=-1,
             )
             distances = torch.cdist(ideal, candidate_features).squeeze(0)
@@ -311,3 +327,223 @@ class NCDMDDPGPolicy(DDPGPolicy):
         uses_privileged_information=False,
         notes="Actor action = Q-mask + NCDM difficulty + NCDM discrimination",
     )
+
+
+class NCDMDDPGDiversePolicy(NCDMDDPGPolicy):
+    """Top-K exposure-aware reranker using an existing NCDM-DDPG actor.
+
+    The actor remains frozen.  The policy first retrieves the nearest ``top_k``
+    real items using a block-normalized distance, then reranks them with global
+    exposure, within-student novelty and uncovered-concept terms.  Exposure
+    counts persist across students within one benchmark seed and are recreated
+    when the evaluator creates a new policy for the next seed.
+    """
+
+    name = "NCDM-DDPG-Diverse"
+
+    def __init__(
+        self,
+        checkpoint: str | Path,
+        *,
+        top_k: int = 32,
+        exposure_weight: float = 0.05,
+        novelty_weight: float = 0.05,
+        coverage_weight: float = 0.05,
+        q_distance_weight: float = 1.0,
+        difficulty_distance_weight: float = 1.0,
+        discrimination_distance_weight: float = 1.0,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(checkpoint, **kwargs)
+        self.top_k = int(top_k)
+        self.exposure_weight = float(exposure_weight)
+        self.novelty_weight = float(novelty_weight)
+        self.coverage_weight = float(coverage_weight)
+        self.q_distance_weight = float(q_distance_weight)
+        self.difficulty_distance_weight = float(difficulty_distance_weight)
+        self.discrimination_distance_weight = float(
+            discrimination_distance_weight
+        )
+        if self.top_k <= 0:
+            raise ValueError("top_k must be positive")
+        for label, value in {
+            "exposure_weight": self.exposure_weight,
+            "novelty_weight": self.novelty_weight,
+            "coverage_weight": self.coverage_weight,
+            "q_distance_weight": self.q_distance_weight,
+            "difficulty_distance_weight": self.difficulty_distance_weight,
+            "discrimination_distance_weight": self.discrimination_distance_weight,
+        }.items():
+            if value < 0:
+                raise ValueError(f"{label} must be non-negative")
+
+        self.global_exposure: Counter[int] = Counter()
+        self.metadata = PolicyMetadata(
+            name=self.name,
+            implementation="checkpoint_plus_deterministic_reranker",
+            selection_model="lstm_ddpg_topk_exposure_novelty_coverage_reranker",
+            evaluator_model="NCDM",
+            uses_query_labels=False,
+            uses_privileged_information=False,
+            notes=(
+                f"top_k={self.top_k}; exposure={self.exposure_weight}; "
+                f"novelty={self.novelty_weight}; coverage={self.coverage_weight}; "
+                f"distance_weights=({self.q_distance_weight},"
+                f"{self.difficulty_distance_weight},"
+                f"{self.discrimination_distance_weight})"
+            ),
+        )
+
+    def _block_distance(
+        self,
+        ideal: torch.Tensor,
+        q_features: torch.Tensor,
+        difficulty: torch.Tensor,
+        discrimination: torch.Tensor,
+    ) -> torch.Tensor:
+        q_dim = int(self.q_matrix.shape[1])
+        ideal_q = ideal[:, :q_dim]
+        ideal_difficulty = ideal[:, q_dim : 2 * q_dim]
+        ideal_discrimination = ideal[:, 2 * q_dim : 2 * q_dim + 1]
+        q_distance = torch.mean((q_features - ideal_q) ** 2, dim=1)
+        difficulty_distance = torch.mean(
+            (difficulty - ideal_difficulty) ** 2,
+            dim=1,
+        )
+        discrimination_distance = torch.mean(
+            (discrimination - ideal_discrimination) ** 2,
+            dim=1,
+        )
+        return (
+            self.q_distance_weight * q_distance
+            + self.difficulty_distance_weight * difficulty_distance
+            + self.discrimination_distance_weight * discrimination_distance
+        )
+
+    def _novelty_scores(
+        self,
+        candidate_tensor: torch.Tensor,
+        history_item_ids: Sequence[int],
+    ) -> torch.Tensor:
+        history = [
+            int(item)
+            for item in history_item_ids
+            if 0 <= int(item) < self.valid_item_count
+        ]
+        if not history:
+            return torch.zeros(
+                candidate_tensor.shape[0],
+                dtype=torch.float32,
+                device=self.device,
+            )
+        history_tensor = torch.tensor(
+            history,
+            dtype=torch.long,
+            device=self.device,
+        )
+        candidate_q = torch.nn.functional.normalize(
+            self.q_matrix[candidate_tensor],
+            p=2,
+            dim=1,
+        )
+        history_q = torch.nn.functional.normalize(
+            self.q_matrix[history_tensor],
+            p=2,
+            dim=1,
+        )
+        q_similarity = torch.clamp(
+            candidate_q @ history_q.transpose(0, 1),
+            min=0.0,
+            max=1.0,
+        ).max(dim=1).values
+        semantic_similarity = torch.clamp(
+            self.item_bank[candidate_tensor]
+            @ self.item_bank[history_tensor].transpose(0, 1),
+            min=-1.0,
+            max=1.0,
+        ).max(dim=1).values
+        semantic_similarity = (semantic_similarity + 1.0) * 0.5
+        return 1.0 - 0.5 * (q_similarity + semantic_similarity)
+
+    def _coverage_gain_scores(
+        self,
+        candidate_tensor: torch.Tensor,
+        history_item_ids: Sequence[int],
+    ) -> torch.Tensor:
+        q_dim = int(self.q_matrix.shape[1])
+        history = [
+            int(item)
+            for item in history_item_ids
+            if 0 <= int(item) < self.valid_item_count
+        ]
+        if history:
+            history_tensor = torch.tensor(
+                history,
+                dtype=torch.long,
+                device=self.device,
+            )
+            covered = self.q_matrix[history_tensor].sum(dim=0) > 0
+        else:
+            covered = torch.zeros(q_dim, dtype=torch.bool, device=self.device)
+        candidate_concepts = self.q_matrix[candidate_tensor] > 0
+        new_concepts = candidate_concepts & (~covered.unsqueeze(0))
+        return new_concepts.float().sum(dim=1) / max(1, q_dim)
+
+    def select(
+        self,
+        candidate_item_ids: Sequence[int],
+        history_item_ids: Sequence[int],
+        history_responses: Sequence[float],
+        context: dict[str, Any],
+    ) -> int:
+        candidates = self._validate_selection_inputs(candidate_item_ids, context)
+        if self.actor is None:
+            selected = candidates[0]
+            self.global_exposure[selected] += 1
+            return selected
+
+        with torch.no_grad():
+            ideal = self._sync_history(history_item_ids, history_responses)
+            candidate_tensor = torch.tensor(
+                candidates,
+                dtype=torch.long,
+                device=self.device,
+            )
+            q_features, difficulty, discrimination = self._candidate_feature_blocks(
+                candidate_tensor
+            )
+            distance = self._block_distance(
+                ideal,
+                q_features,
+                difficulty,
+                discrimination,
+            )
+            top_k = min(self.top_k, len(candidates))
+            top_indices = torch.argsort(distance, stable=True)[:top_k]
+            top_candidates = candidate_tensor[top_indices]
+            top_distance = distance[top_indices]
+
+            exposure_penalty = torch.tensor(
+                [
+                    math.log1p(self.global_exposure[int(item)])
+                    for item in top_candidates.detach().cpu().tolist()
+                ],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            novelty = self._novelty_scores(top_candidates, history_item_ids)
+            coverage_gain = self._coverage_gain_scores(
+                top_candidates,
+                history_item_ids,
+            )
+            score = (
+                -top_distance
+                - self.exposure_weight * exposure_penalty
+                + self.novelty_weight * novelty
+                + self.coverage_weight * coverage_gain
+            )
+            best_local_index = int(torch.argmax(score).item())
+            selected = int(top_candidates[best_local_index].item())
+
+        self.global_exposure[selected] += 1
+        return selected
