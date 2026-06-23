@@ -7,3 +7,9 @@ checkpoints/
 outputs/
 wandb/
 *.ckpt
+
+# Conic10K audit outputs and downloaded data
+artifacts/
+data/conic10k/
+research/cognitive_item_embedding/data/
+research/cognitive_item_embedding/artifacts/

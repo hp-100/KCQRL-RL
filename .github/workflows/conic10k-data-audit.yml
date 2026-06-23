@@ -1,0 +1,42 @@
+name: Conic10K data audit
+
+on:
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install datasets pandas pyarrow pytest
+          python -m pip install -r requirements.txt || true
+      - name: Download and inspect real Conic10K
+        run: |
+          python research/cognitive_item_embedding/scripts/inspect_dataset.py \
+            --output-dir artifacts/conic10k_audit \
+            --report artifacts/conic10k_audit/DATA_AUDIT_REPORT.md
+      - name: Generate fixed 100-item sample
+        run: |
+          python research/cognitive_item_embedding/scripts/sample_items.py \
+            --output-dir artifacts/conic10k_sample \
+            --n 100 \
+            --seed 20240623
+      - name: Run tests
+        run: pytest
+      - name: Upload audit and sample artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: conic10k-real-data-audit-and-sample
+          path: |
+            artifacts/conic10k_audit/DATA_AUDIT_REPORT.md
+            artifacts/conic10k_audit/audit_stats.json
+            artifacts/conic10k_sample/conic10k_100_item_review_sample.csv
+            artifacts/conic10k_sample/conic10k_100_item_review_sample.jsonl
+            artifacts/conic10k_sample/conic10k_100_item_review_sample.html
+          if-no-files-found: error
