@@ -116,3 +116,19 @@ drive.mount('/content/drive')
 `benchmark_v2` reports **selector-level** comparisons by default: Random, heuristic selectors, formal MIRT selectors, and DDPG may use different item-selection models, but query-set evaluation is kept on the same frozen NCDM predictor. This isolates the value of the selector while avoiding end-to-end model/evaluator changes. In contrast, an **end-to-end** comparison would evaluate each selector with its own response model (for example, MIRT-selected histories evaluated by MIRT), which answers a different question and is not directly comparable to the DDPG selector-level benchmark.
 
 Formal MIRT selectors (`MIRT-Trace-MFI`, `MIRT-D-opt`, `MIRT-MKLI`) load `assets.mirt_checkpoint`, infer the checkpoint dimensions dynamically, freeze item parameters, and refit an independent test-student theta from support history before every selection. Legacy `MIRT-MFI` and `MIRT-KLI` remain heuristic proxy baselines and are marked as such in policy metadata.
+
+## Conic10K audit workflow
+
+This repository includes a Conic10K data-audit workflow that downloads the real dataset at run time, audits the official fields (`text`, `process`, `answer_expressions`, `fact_expressions`, `query_expressions`, `fact_spans`, and `query_spans`), and generates a seeded 100-item manual-review sample without committing or uploading the complete raw dataset.
+
+Run locally:
+
+```bash
+python scripts/download_conic10k.py --out-dir data/conic10k
+python -m conic10k.audit --data-dir data/conic10k --out-dir artifacts/conic10k --sample-size 100 --seed 20260623
+pytest tests/test_conic10k_audit.py
+```
+
+The audit report includes total and split counts, field/type inventories, field missingness counts and ratios, text/process length distributions, empty answers/processes, short rationales, exact and whitespace-normalized duplicate question text, replacement-character anomalies, and required-field presence checks. The review sample is stratified by both text length and process length and is written as CSV, JSONL, and HTML with blank human-review columns.
+
+The GitHub Actions workflow `Conic10K audit` runs on both `pull_request` and `workflow_dispatch`, downloads Conic10K, runs the audit, runs the tests, and uploads only `conic10k-audit-review-sample` artifacts (audit JSON plus the 100-item CSV/JSONL/HTML sample), not the complete raw data.
