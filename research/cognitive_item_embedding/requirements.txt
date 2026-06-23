@@ -1,0 +1,3 @@
+# Optional: enables preferred Hugging Face loading path. Scripts also include a stdlib fallback.
+datasets>=2.18
+pytest>=8
