@@ -105,3 +105,69 @@ def pad_c3dqn_batch(samples: Sequence[dict], cache: NCDMItemFeatureCache, select
         glob[row] = build_global_feature(torch.as_tensor(s["mastery"], device=cache.device), torch.as_tensor(s["coverage"], device=cache.device), int(s["policy_step"]), selection_horizon)
         action[row] = cids.index(int(s["selected_item_id"]))
     return {"history_features": hist, "history_mask": hist_mask, "candidate_features": cand, "candidate_mask": cand_mask, "global_features": glob, "action_index": action}
+
+@dataclass(frozen=True)
+class NCDMDiagnosticState:
+    alpha: torch.Tensor
+    mastery: torch.Tensor
+    coverage_count: torch.Tensor
+    coverage: torch.Tensor
+    query_nll: float | None = None
+
+
+def prefilter_candidates_vectorized(
+    candidate_item_ids: Sequence[int],
+    *,
+    cache: NCDMItemFeatureCache,
+    ncdm: OfficialNCDM | None,
+    alpha: torch.Tensor,
+    mastery: torch.Tensor,
+    coverage_count: torch.Tensor,
+    top_k: int = 256,
+    uncertainty_weight: float = 0.45,
+    weakness_weight: float = 0.30,
+    novelty_weight: float = 0.15,
+    discrimination_weight: float = 0.10,
+    diversity_enabled: bool = True,
+    diversity_fraction: float = 0.20,
+) -> list[int]:
+    """Deterministic O(CK) diagnostic prefilter before candidate-history attention."""
+    ids = torch.as_tensor(list(candidate_item_ids), dtype=torch.long, device=cache.device)
+    if ids.numel() == 0:
+        return []
+    k = min(int(top_k), int(ids.numel()))
+    q_mask = cache.q_masks[ids]
+    denom = q_mask.sum(-1).clamp_min(1.0)
+    if ncdm is not None:
+        with torch.no_grad():
+            p_correct = ncdm.predict_with_alpha(alpha, ids, cache.q_matrix).float().clamp(0, 1)
+        uncertainty = 4.0 * p_correct * (1.0 - p_correct)
+    else:
+        uncertainty = torch.zeros(ids.shape[0], device=cache.device)
+    weakness = ((1.0 - mastery.float()).view(1, -1) * q_mask).sum(-1) / denom
+    novelty = (q_mask * (coverage_count.float().view(1, -1) == 0).float()).sum(-1) / denom
+    discrimination = cache.disc_norms[ids].squeeze(-1)
+    score = float(uncertainty_weight) * uncertainty + float(weakness_weight) * weakness + float(novelty_weight) * novelty + float(discrimination_weight) * discrimination
+    if not diversity_enabled or k <= 1:
+        return ids[torch.argsort(score, descending=True, stable=True)[:k]].detach().cpu().tolist()
+    primary_k = max(1, int(round(k * (1.0 - float(diversity_fraction)))))
+    primary_idx = torch.argsort(score, descending=True, stable=True)[:primary_k]
+    selected = primary_idx.detach().cpu().tolist()
+    selected_set = set(selected)
+    covered = q_mask[primary_idx].sum(0) if selected else torch.zeros(cache.knowledge_dim, device=cache.device)
+    for concept in torch.argsort(covered, stable=True).detach().cpu().tolist():
+        if len(selected) >= k:
+            break
+        has_concept = torch.nonzero(q_mask[:, int(concept)] > 0, as_tuple=False).flatten()
+        if has_concept.numel() == 0:
+            continue
+        ordered = has_concept[torch.argsort(score[has_concept], descending=True, stable=True)]
+        for idx in ordered.detach().cpu().tolist():
+            if idx not in selected_set:
+                selected.append(idx); selected_set.add(idx); break
+    if len(selected) < k:
+        for idx in torch.argsort(score, descending=True, stable=True).detach().cpu().tolist():
+            if idx not in selected_set:
+                selected.append(idx); selected_set.add(idx)
+                if len(selected) >= k: break
+    return ids[torch.tensor(selected, dtype=torch.long, device=cache.device)].detach().cpu().tolist()

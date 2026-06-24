@@ -1,0 +1,24 @@
+profile:
+  cases:
+    - name: Base C3DQN, Top-K=128
+      candidate_set_encoder: isab
+      num_inducing_points: 1
+      prefilter_top_k: 128
+    - name: Set-C3DQN ISAB M=8, Top-K=128
+      candidate_set_encoder: isab
+      num_inducing_points: 8
+      prefilter_top_k: 128
+    - name: Set-C3DQN ISAB M=16, Top-K=256
+      candidate_set_encoder: isab
+      num_inducing_points: 16
+      prefilter_top_k: 256
+    - name: Set-C3DQN Full Attention, Top-K=128
+      candidate_set_encoder: full_self_attention
+      full_attention_max_candidates: 128
+      prefilter_top_k: 128
+  metrics:
+    - forward milliseconds
+    - training step milliseconds
+    - peak memory
+    - parameters
+    - candidate count
