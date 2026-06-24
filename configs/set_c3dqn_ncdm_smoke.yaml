@@ -1,0 +1,56 @@
+device: auto
+paths:
+  q_matrix: data/q_matrix.pt
+  ncdm_checkpoint: outputs/ncdm/best.pt
+  train_valid_sequences: data/train_valid_sequences.csv
+model:
+  architecture: set_c3dqn
+  d_model: 64
+  n_heads: 4
+  num_history_layers: 1
+  dropout: 0.1
+  candidate_set_encoder: isab
+  num_set_layers: 1
+  num_inducing_points: 8
+  set_attention_heads: 4
+  use_relative_features: true
+  set_pool_in_value_head: true
+  full_attention_max_candidates: 128
+  debug_mode: false
+candidate_pool:
+  prefilter_enabled: true
+  prefilter_top_k: 128
+  diversity_quota: 16
+  weights:
+    uncertainty: 0.35
+    weakness: 0.25
+    novelty: 0.15
+    difficulty: 0.15
+    discrimination: 0.10
+alpha_fit:
+  initial_steps: 8
+  incremental_steps: 3
+  lr: 0.05
+  early_stop_tol: 0.00001
+  grad_clip: 5.0
+training:
+  output_dir: outputs/set_c3dqn_ncdm_smoke
+  seed: 42
+  epochs: 1
+  max_students: 20
+  train_ratio: 0.8
+  query_ratio: 0.2
+  min_query_items: 2
+  selection_horizon: 5
+  batch_size: 8
+  replay_capacity: 1000
+  min_replay_size: 8
+  updates_per_environment_step: 1
+  learning_rate: 0.001
+  gamma: 0.99
+  gradient_clip: 5.0
+  tau: 0.01
+  epsilon_start: 1.0
+  epsilon_end: 0.05
+  epsilon_decay_steps: 100
+  use_amp: true
