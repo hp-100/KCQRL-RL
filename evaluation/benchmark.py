@@ -13,14 +13,14 @@ import yaml
 from evaluation.offline_eval import CATOfflineEvaluator, MissingAssetsError, StudentSequence
 from evaluation.metrics import metric_bundle, nanmean, gini, nll_score
 from evaluation.protocol import StudentSplit, make_student_split, save_manifest, valid_item_count, selection_horizon_from_config
-from evaluation.policies import RandomPolicy, HeuristicMIRTPolicy, FormalMIRTPolicy, DDPGPolicy, OneStepOraclePolicy, DDPGMIRTPolicy, RandomMIRTPolicy, RDPGMIRTPolicy, RandomNCDMPolicy, C3DQNNCDMPolicy
+from evaluation.policies import RandomPolicy, HeuristicMIRTPolicy, FormalMIRTPolicy, DDPGPolicy, OneStepOraclePolicy, DDPGMIRTPolicy, RandomMIRTPolicy, RDPGMIRTPolicy, RandomNCDMPolicy, C3DQNNCDMPolicy, SetC3DQNNCDMPolicy
 from models.ncdm import OfficialNCDM, fit_student_alpha, safe_load_ncdm_checkpoint
 from models.mirt import MIRTModel, load_mirt_checkpoint, fit_student_theta as fit_mirt_theta, predict_with_theta as mirt_predict_with_theta
 from models.actor import LSTMActor
 
 
 class BenchmarkV2Evaluator:
-    def __init__(self, config: Mapping, *, debug=False, ddpg_checkpoint="outputs/ddpg_actor.pt", ddpg_mirt_checkpoint=None, rdpg_mirt_checkpoint=None, c3dqn_ncdm_checkpoint=None, track=None, seeds=None, max_students=None, steps=None, output_dir=None, policies=None):
+    def __init__(self, config: Mapping, *, debug=False, ddpg_checkpoint="outputs/ddpg_actor.pt", ddpg_mirt_checkpoint=None, rdpg_mirt_checkpoint=None, c3dqn_ncdm_checkpoint=None, set_c3dqn_ncdm_checkpoint=None, track=None, seeds=None, max_students=None, steps=None, output_dir=None, policies=None):
         self.config = dict(config)
         b = dict((config.get("benchmark") or {}))
         self.debug = debug
@@ -38,11 +38,12 @@ class BenchmarkV2Evaluator:
         self.ddpg_mirt_checkpoint = Path(ddpg_mirt_checkpoint or b.get("ddpg_mirt_checkpoint", "outputs/mirt_ddpg/ddpg_mirt_actor_best.pt"))
         self.rdpg_mirt_checkpoint = Path(rdpg_mirt_checkpoint or b.get("rdpg_mirt_checkpoint", "outputs/mirt_rdpg/rdpg_mirt_actor_best.pt"))
         self.c3dqn_ncdm_checkpoint = Path(c3dqn_ncdm_checkpoint or b.get("c3dqn_ncdm_checkpoint", "outputs/ncdm_c3dqn/best_checkpoint.pt"))
+        self.set_c3dqn_ncdm_checkpoint = Path(set_c3dqn_ncdm_checkpoint or b.get("set_c3dqn_ncdm_checkpoint", "outputs/set_c3dqn_ncdm/best_checkpoint.pt"))
         self.track = track or b.get("track", "benchmark_v2")
         if self.track == "mirt_native" and policies is None and "policies" not in b:
             self.policy_names = ["Random-MIRT","MIRT-Trace-MFI","MIRT-D-opt","MIRT-MKLI","DDPG-MIRT","RDPG-MIRT"]
         if self.track == "ncdm_native" and policies is None and "policies" not in b:
-            self.policy_names = ["Random-NCDM", "C3DQN-NCDM"]
+            self.policy_names = ["Random-NCDM", "C3DQN-NCDM", "Set-C3DQN-NCDM"]
         self.device = torch.device("cuda" if torch.cuda.is_available() and config.get("device") != "cpu" else "cpu")
 
     def _load_or_synthetic(self):
@@ -149,6 +150,9 @@ class BenchmarkV2Evaluator:
             elif name == "C3DQN-NCDM":
                 expected = {"selection_horizon": self.selection_horizon, "warm_start_items": 1, "q_matrix_item_count": int(q.shape[0]), "ncdm_item_count": int(ncdm.k_difficulty.num_embeddings), "strict_item_count_check": True}
                 policies.append(C3DQNNCDMPolicy(self.c3dqn_ncdm_checkpoint, ncdm, q_t, device=self.device, expected_protocol_config=expected))
+            elif name == "Set-C3DQN-NCDM":
+                expected = {"selection_horizon": self.selection_horizon, "warm_start_items": 1, "q_matrix_item_count": int(q.shape[0]), "ncdm_item_count": int(ncdm.k_difficulty.num_embeddings), "strict_item_count_check": True}
+                policies.append(SetC3DQNNCDMPolicy(self.set_c3dqn_ncdm_checkpoint, ncdm, q_t, device=self.device, expected_protocol_config=expected))
             elif name == "DDPG":
                 actor=None
                 if self.ddpg_checkpoint.exists():
@@ -222,7 +226,7 @@ class BenchmarkV2Evaluator:
                         item=pol.select(avail, hist_i, hist_r, ctx)
                         if item not in avail: raise RuntimeError(f"{pol.name} selected item outside candidate pool")
                         cand.remove(item); resp=cresp[item]; hist_i.append(item); hist_r.append(resp); selected.append(item); selected_r.append(resp); exposures[t+1][item]+=1
-                    traces.append({"student_id":sp.student_id,"policy":pol.name,"seed":seed,"warm_start_item":sp.warm_start_item,"selected_items":selected,"selected_responses":selected_r,"query_items":sp.query_item_ids})
+                    traces.append({"student_id":sp.student_id,"policy":pol.name,"seed":seed,"warm_start_item":sp.warm_start_item,"selected_items":selected,"selected_responses":selected_r,"query_items":sp.query_item_ids,"raw_candidate_ids":getattr(pol,"last_raw_candidate_ids",[]),"prefiltered_candidate_ids":getattr(pol,"last_prefiltered_candidate_ids",[]),"prefilter_score_summary":getattr(pol,"last_prefilter_score_summary",{})})
                 for step in self.steps:
                     yt,ys=step_pred[step]; evaluated_students=len(step_stu[step]); eligible_students=sum(1 for sp in splits if len(sp.support_item_ids) - 1 >= step); incomplete_students=len(splits)-evaluated_students
                     if step in expected_evaluated_by_step and expected_evaluated_by_step[step] != evaluated_students:
@@ -250,7 +254,7 @@ class BenchmarkV2Evaluator:
                 for tr in traces: f.write(json.dumps(tr)+"\n")
         (self.output_dir/"policy_metadata.json").write_text(json.dumps(metadata,indent=2))
         run_config=dict(self.config)
-        run_config["benchmark"]={**dict(run_config.get("benchmark") or {}), "protocol":"benchmark_v2", "seeds":self.seeds, "max_students":self.max_students, "steps":self.steps, "output_dir":str(self.output_dir), "candidate_size":self.candidate_size, "ddpg_checkpoint":str(self.ddpg_checkpoint), "ddpg_mirt_checkpoint":str(self.ddpg_mirt_checkpoint), "rdpg_mirt_checkpoint":str(self.rdpg_mirt_checkpoint), "c3dqn_ncdm_checkpoint":str(self.c3dqn_ncdm_checkpoint), "selection_horizon":self.selection_horizon, "track":self.track, "policies":self.policy_names, "device":str(self.device), "synthetic":bool(synthetic), "debug":bool(self.debug)}
+        run_config["benchmark"]={**dict(run_config.get("benchmark") or {}), "protocol":"benchmark_v2", "seeds":self.seeds, "max_students":self.max_students, "steps":self.steps, "output_dir":str(self.output_dir), "candidate_size":self.candidate_size, "ddpg_checkpoint":str(self.ddpg_checkpoint), "ddpg_mirt_checkpoint":str(self.ddpg_mirt_checkpoint), "rdpg_mirt_checkpoint":str(self.rdpg_mirt_checkpoint), "c3dqn_ncdm_checkpoint":str(self.c3dqn_ncdm_checkpoint), "set_c3dqn_ncdm_checkpoint":str(self.set_c3dqn_ncdm_checkpoint), "selection_horizon":self.selection_horizon, "track":self.track, "policies":self.policy_names, "device":str(self.device), "synthetic":bool(synthetic), "debug":bool(self.debug)}
         run_config["device"] = str(self.device)
         (self.output_dir/"run_config.yaml").write_text(yaml.safe_dump(run_config))
         return all_rows

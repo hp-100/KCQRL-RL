@@ -1,0 +1,19 @@
+benchmark:
+  track: ncdm_native
+  policies: [Random-NCDM, C3DQN-NCDM, Set-C3DQN-NCDM]
+  c3dqn_ncdm_checkpoint: outputs/ncdm_c3dqn/best_checkpoint.pt
+  set_c3dqn_ncdm_checkpoint: outputs/set_c3dqn_ncdm/best_checkpoint.pt
+  candidate_pool_config:
+    prefilter_enabled: true
+    prefilter_top_k: 128
+ablations:
+  base_c3dqn:
+    model: {architecture: base_c3dqn}
+  set_none:
+    model: {architecture: set_c3dqn, candidate_set_encoder: none, use_relative_features: false, set_pool_in_value_head: false}
+  relative_only:
+    model: {architecture: set_c3dqn, candidate_set_encoder: none, use_relative_features: true, set_pool_in_value_head: false}
+  isab_only:
+    model: {architecture: set_c3dqn, candidate_set_encoder: isab, use_relative_features: false, set_pool_in_value_head: true}
+  full_efficient_set_c3dqn:
+    model: {architecture: set_c3dqn, candidate_set_encoder: isab, use_relative_features: true, set_pool_in_value_head: true}
