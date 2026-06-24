@@ -88,3 +88,26 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+def build_q_network_from_config(model_cfg: dict, knowledge_dim: int):
+    """Build Base or Set C3DQN network from a public config dict."""
+    from models.ncdm_candidate_q_network import CandidateConditionedNCDMQNetwork
+    from models.set_ncdm_candidate_q_network import SetConditionedNCDMQNetwork
+    cfg = dict(model_cfg or {})
+    arch = cfg.get("architecture", "base_c3dqn")
+    common = {"d_model": int(cfg.get("d_model", 64)), "n_heads": int(cfg.get("n_heads", 4)), "num_history_layers": int(cfg.get("num_history_layers", 1)), "dropout": float(cfg.get("dropout", 0.0))}
+    if arch == "base_c3dqn":
+        return CandidateConditionedNCDMQNetwork(knowledge_dim, **common)
+    if arch == "set_c3dqn":
+        return SetConditionedNCDMQNetwork(
+            knowledge_dim, **common,
+            candidate_set_encoder=cfg.get("candidate_set_encoder", "isab"),
+            num_set_layers=int(cfg.get("num_set_layers", 1)),
+            num_inducing_points=int(cfg.get("num_inducing_points", 16)),
+            set_attention_heads=int(cfg.get("set_attention_heads", common["n_heads"])),
+            use_relative_features=bool(cfg.get("use_relative_features", True)),
+            set_pool_in_value_head=bool(cfg.get("set_pool_in_value_head", True)),
+            full_attention_max_candidates=int(cfg.get("full_attention_max_candidates", 128)),
+            debug_mode=bool(cfg.get("debug_mode", False)),
+        )
+    raise ValueError(f"unknown model.architecture: {arch}")

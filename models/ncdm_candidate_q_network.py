@@ -31,7 +31,7 @@ class CandidateConditionedNCDMQNetwork(nn.Module):
         if not (history_mask.any(dim=1).all() and candidate_mask.any(dim=1).all()):
             raise ValueError("each sample must have at least one valid history and candidate")
 
-    def forward(self, history_features, history_mask, candidate_features, candidate_mask, global_features, return_attention: bool = False):
+    def forward(self, history_features, history_mask, candidate_features, candidate_mask, global_features, return_attention: bool = False, coverage_count=None):
         self._assert_shapes(history_features, history_mask, candidate_features, candidate_mask, global_features)
         if not all(torch.isfinite(x).all() for x in (history_features, candidate_features, global_features)):
             raise ValueError("non-finite C3DQN input")
