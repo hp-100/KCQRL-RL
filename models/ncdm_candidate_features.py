@@ -74,7 +74,7 @@ class NCDMItemFeatureCache:
 
 def build_global_feature(mastery: torch.Tensor, coverage: torch.Tensor, policy_step: int, selection_horizon: int) -> torch.Tensor:
     mastery = mastery.float().flatten()
-    coverage = coverage.float().flatten().clamp(0, 1)
+    coverage = (coverage.float().flatten() / float(selection_horizon)).clamp(0, 1)
     if mastery.shape != coverage.shape:
         raise ValueError(f"mastery/coverage shape mismatch: {mastery.shape} != {coverage.shape}")
     step = torch.tensor([float(policy_step) / float(selection_horizon)], dtype=mastery.dtype, device=mastery.device)
@@ -94,6 +94,7 @@ def pad_c3dqn_batch(samples: Sequence[dict], cache: NCDMItemFeatureCache, select
     cand = torch.zeros((b, max_c, 2*k+1), device=cache.device)
     cand_mask = torch.zeros((b, max_c), dtype=torch.bool, device=cache.device)
     glob = torch.zeros((b, 2*k+1), device=cache.device)
+    coverage_count = torch.zeros((b, k), device=cache.device)
     action = torch.zeros((b,), dtype=torch.long, device=cache.device)
     for row, s in enumerate(samples):
         h = cache.history(s["history_item_ids"], s["history_responses"], selection_horizon)
@@ -102,6 +103,8 @@ def pad_c3dqn_batch(samples: Sequence[dict], cache: NCDMItemFeatureCache, select
         if int(s["selected_item_id"]) not in cids:
             raise ValueError(f"selected_item_id {s['selected_item_id']} is not in candidate_item_ids")
         cf = cache.candidate(cids); cand[row, :cf.shape[0]] = cf; cand_mask[row, :cf.shape[0]] = True
-        glob[row] = build_global_feature(torch.as_tensor(s["mastery"], device=cache.device), torch.as_tensor(s["coverage"], device=cache.device), int(s["policy_step"]), selection_horizon)
+        cov_count = torch.as_tensor(s.get("coverage_count", s["coverage"]), dtype=torch.float32, device=cache.device)
+        coverage_count[row] = cov_count
+        glob[row] = build_global_feature(torch.as_tensor(s["mastery"], device=cache.device), cov_count, int(s["policy_step"]), selection_horizon)
         action[row] = cids.index(int(s["selected_item_id"]))
-    return {"history_features": hist, "history_mask": hist_mask, "candidate_features": cand, "candidate_mask": cand_mask, "global_features": glob, "action_index": action}
+    return {"history_features": hist, "history_mask": hist_mask, "candidate_features": cand, "candidate_mask": cand_mask, "global_features": glob, "coverage_count": coverage_count, "action_index": action}
