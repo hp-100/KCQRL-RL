@@ -21,6 +21,7 @@ from evaluation.protocol import make_student_split, valid_item_count
 from models.ncdm import fit_student_alpha
 from models.ncdm_candidate_features import NCDMItemFeatureCache, pad_c3dqn_batch
 from models.ncdm_candidate_q_network import CandidateConditionedNCDMQNetwork
+from models.ncdm_candidate_prefilter import NCDMCandidatePrefilter
 from reward.ncdm_diagnostic_reward import NCDMDiagnosticRewardConfig, compute_ncdm_diagnostic_reward, mastery_entropy
 
 
@@ -42,6 +43,10 @@ class C3DQNTransition:
     next_coverage: list[float]
     next_policy_step: int
     done: bool
+    coverage_count: list[float] | None = None
+    next_coverage_count: list[float] | None = None
+    raw_candidate_count: int = 0
+    filtered_candidate_count: int = 0
 
 
 class C3DQNReplayBuffer:
@@ -85,6 +90,7 @@ def _samples_from_transitions(transitions: Sequence[C3DQNTransition], *, next_st
             "history_responses": t.next_history_responses if next_state else t.history_responses,
             "candidate_item_ids": cands,
             "mastery": t.next_mastery if next_state else t.mastery,
+            "coverage_count": t.next_coverage_count if next_state else t.coverage_count,
             "coverage": t.next_coverage if next_state else t.coverage,
             "policy_step": t.next_policy_step if next_state else t.policy_step,
             "selected_item_id": cands[0] if next_state else t.selected_item_id,
@@ -201,7 +207,7 @@ class NCDMC3DQNTrainer:
         self.epsilon_start = float(kwargs.get("epsilon_start", 1.0))
         self.epsilon_end = float(kwargs.get("epsilon_end", 0.05))
         self.epsilon_decay_steps = int(kwargs.get("epsilon_decay_steps", 1000))
-        self.alpha_fit = dict(kwargs.get("alpha_fit") or {"steps": 8, "lr": 0.05, "early_stop_tol": 1e-5, "grad_clip": 5.0})
+        self.alpha_fit = dict(kwargs.get("alpha_fit") or {"initial_steps": 8, "incremental_steps": 3, "lr": 0.05, "early_stop_tol": 1e-5, "grad_clip": 5.0})
         self.reward_cfg = NCDMDiagnosticRewardConfig(**dict(kwargs.get("reward_config") or {}))
         self.model_config = dict(kwargs.get("model_config") or {})
         self.seed = int(kwargs.get("seed", 0))
@@ -214,6 +220,12 @@ class NCDMC3DQNTrainer:
         self.time_acc = defaultdict(float)
         self.ncdm = kwargs.get("ncdm")
         self.q_matrix = kwargs.get("q_matrix", self.cache.q_matrix)
+        self.candidate_pool_config = dict(kwargs.get("candidate_pool_config") or {"prefilter_enabled": True, "prefilter_top_k": 256})
+        self.prefilter = NCDMCandidatePrefilter(q_matrix=self.q_matrix, feature_cache=self.cache, ncdm=self.ncdm, config=self.candidate_pool_config) if self.ncdm is not None else None
+        requested_amp = bool(kwargs.get("requested_amp", kwargs.get("amp", False)))
+        self.requested_amp = requested_amp
+        self.use_amp = bool(requested_amp and self.cache.device.type == "cuda")
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
     def _epsilon(self) -> float:
         frac = min(1.0, self.learning_steps / max(1, self.epsilon_decay_steps))
@@ -230,7 +242,14 @@ class NCDMC3DQNTrainer:
         if self.ncdm is None:
             return torch.zeros((1, self.cache.knowledge_dim), device=self.cache.device)
         t0 = time.perf_counter()
-        alpha = fit_student_alpha(self.ncdm, self.q_matrix, hist_i, hist_r, initial_alpha=initial_alpha, device=self.cache.device, **self.alpha_fit)
+        af = dict(self.alpha_fit)
+        if initial_alpha is None:
+            steps = int(af.pop("initial_steps", af.get("steps", 8)))
+            af.pop("incremental_steps", None)
+        else:
+            steps = int(af.pop("incremental_steps", af.get("steps", 3)))
+            af.pop("initial_steps", None)
+        alpha = fit_student_alpha(self.ncdm, self.q_matrix, hist_i, hist_r, initial_alpha=initial_alpha, steps=steps, device=self.cache.device, **af)
         self.time_acc["alpha_fit_seconds"] += time.perf_counter() - t0
         return alpha
 
@@ -239,16 +258,20 @@ class NCDMC3DQNTrainer:
             return torch.zeros(self.cache.knowledge_dim, device=self.cache.device)
         return self.cache.q_masks[torch.tensor(items, dtype=torch.long, device=self.cache.device)].sum(dim=0)
 
-    def _select(self, hist_i, hist_r, cand, mastery, coverage, policy_step, epsilon=None) -> int:
+    def _select(self, hist_i, hist_r, cand, mastery, coverage, policy_step, epsilon=None):
+        if self.prefilter is not None:
+            t0 = time.perf_counter(); filtered, summary = self.prefilter.select(cand, self._fit_alpha(hist_i, hist_r), mastery, coverage); self.time_acc["candidate_prefilter_seconds"] += time.perf_counter() - t0
+        else:
+            filtered, summary = list(cand), {"raw_candidate_count": len(cand), "filtered_candidate_count": len(cand), "candidate_prefilter_seconds": 0.0}
         if random.random() < (self._epsilon() if epsilon is None else epsilon):
-            return int(random.choice(list(cand)))
+            return int(random.choice(list(filtered))), filtered, summary
         t0 = time.perf_counter()
-        row = {"history_item_ids": list(hist_i), "history_responses": list(hist_r), "candidate_item_ids": list(cand), "mastery": mastery.detach().cpu().tolist(), "coverage": (coverage / max(1, self.selection_horizon)).clamp(0, 1).detach().cpu().tolist(), "policy_step": int(policy_step), "selected_item_id": int(cand[0])}
+        row = {"history_item_ids": list(hist_i), "history_responses": list(hist_r), "candidate_item_ids": list(filtered), "mastery": mastery.detach().cpu().tolist(), "coverage": (coverage / max(1, self.selection_horizon)).clamp(0, 1).detach().cpu().tolist(), "policy_step": int(policy_step), "selected_item_id": int(filtered[0])}
         batch = pad_c3dqn_batch([row], self.cache, self.selection_horizon)
         with torch.no_grad():
             q, _ = self.online_net(batch["history_features"], batch["history_mask"], batch["candidate_features"], batch["candidate_mask"], batch["global_features"])
         self.time_acc["network_forward_seconds"] += time.perf_counter() - t0
-        return int(list(cand)[int(q.argmax(dim=1).item())])
+        return int(list(filtered)[int(q.argmax(dim=1).item())]), filtered, summary
 
     def update_once(self) -> dict[str, float] | None:
         if len(self.replay) < self.min_replay_size:
@@ -290,8 +313,8 @@ class NCDMC3DQNTrainer:
         update_stats: list[float] = []
         for t in range(min(self.selection_horizon, len(cand))):
             q_before = nll_score(sp.query_responses, self._predict_query(alpha, sp.query_item_ids))
-            item = self._select(hist_i, hist_r, cand, mastery, coverage_count, t)
-            before_i, before_r, before_c, before_m, before_cov = list(hist_i), list(hist_r), list(cand), mastery.clone(), coverage_count.clone()
+            item, filtered_cand, pre_sum = self._select(hist_i, hist_r, cand, mastery, coverage_count, t)
+            before_i, before_r, before_c, before_m, before_cov = list(hist_i), list(hist_r), list(filtered_cand), mastery.clone(), coverage_count.clone()
             cand.remove(item)
             hist_i.append(item)
             hist_r.append(resp[item])
@@ -303,7 +326,7 @@ class NCDMC3DQNTrainer:
             r = compute_ncdm_diagnostic_reward(q_before, q_after, mastery, mastery2, self.cache.q_masks[item], before_cov, self.reward_cfg)
             self.time_acc["reward_seconds"] += time.perf_counter() - t0
             comps = {"prediction_gain": r.prediction_gain, "diagnosis_gain": r.diagnosis_gain, "coverage_gain": r.coverage_gain, "total": r.total}
-            tr = C3DQNTransition(before_i, before_r, before_c, before_m.detach().cpu().tolist(), (before_cov / max(1, self.selection_horizon)).clamp(0, 1).detach().cpu().tolist(), t, item, r.total, comps, list(hist_i), list(hist_r), list(cand), mastery2.detach().cpu().tolist(), (coverage2 / max(1, self.selection_horizon)).clamp(0, 1).detach().cpu().tolist(), t + 1, (not cand) or t + 1 >= self.selection_horizon)
+            tr = C3DQNTransition(before_i, before_r, before_c, before_m.detach().cpu().tolist(), (before_cov / max(1, self.selection_horizon)).clamp(0, 1).detach().cpu().tolist(), t, item, r.total, comps, list(hist_i), list(hist_r), list(cand), mastery2.detach().cpu().tolist(), (coverage2 / max(1, self.selection_horizon)).clamp(0, 1).detach().cpu().tolist(), t + 1, (not cand) or t + 1 >= self.selection_horizon, before_cov.detach().cpu().tolist(), coverage2.detach().cpu().tolist(), int(pre_sum.get("raw_candidate_count", len(cand)+1)), int(pre_sum.get("filtered_candidate_count", len(filtered_cand))))
             self.replay.push(tr)
             transitions.append(tr)
             rewards.append(comps)
@@ -345,7 +368,7 @@ class NCDMC3DQNTrainer:
             val = self.validate(val_seqs, seed=self.seed + epoch, query_ratio=query_ratio, min_query_items=min_query_items)
             self.time_acc["validation_seconds"] += time.perf_counter() - t0
             cnt = Counter(selected_all)
-            row = {"epoch": epoch, "mean_total_reward": _mean([r["total"] for r in rewards]), "mean_prediction_reward": _mean([r["prediction_gain"] for r in rewards]), "mean_diagnosis_reward": _mean([r["diagnosis_gain"] for r in rewards]), "mean_coverage_reward": _mean([r["coverage_gain"] for r in rewards]), "td_loss": _mean(losses), "mean_q": 0.0, "target_q_mean": 0.0, "epsilon": self._epsilon(), "replay_size": len(self.replay), "selected_unique_items": len(cnt), "item_exposure_gini": gini(cnt.values()), **val, "feature_build_seconds": self.time_acc.get("feature_build_seconds", 1e-9), "alpha_fit_seconds": self.time_acc.get("alpha_fit_seconds", 0.0), "reward_seconds": self.time_acc.get("reward_seconds", 0.0), "network_forward_seconds": self.time_acc.get("network_forward_seconds", 0.0), "network_update_seconds": self.time_acc.get("network_update_seconds", 0.0), "validation_seconds": self.time_acc.get("validation_seconds", 0.0), "total_epoch_seconds": time.perf_counter() - ep_start}
+            row = {"epoch": epoch, "mean_total_reward": _mean([r["total"] for r in rewards]), "mean_prediction_reward": _mean([r["prediction_gain"] for r in rewards]), "mean_diagnosis_reward": _mean([r["diagnosis_gain"] for r in rewards]), "mean_coverage_reward": _mean([r["coverage_gain"] for r in rewards]), "td_loss": _mean(losses), "mean_q": 0.0, "target_q_mean": 0.0, "epsilon": self._epsilon(), "replay_size": len(self.replay), "selected_unique_items": len(cnt), "item_exposure_gini": gini(cnt.values()), **val, "feature_build_seconds": self.time_acc.get("feature_build_seconds", 1e-9), "alpha_fit_seconds": self.time_acc.get("alpha_fit_seconds", 0.0), "reward_seconds": self.time_acc.get("reward_seconds", 0.0), "network_forward_seconds": self.time_acc.get("network_forward_seconds", 0.0), "network_update_seconds": self.time_acc.get("network_update_seconds", 0.0), "validation_seconds": self.time_acc.get("validation_seconds", 0.0), "candidate_prefilter_seconds": self.time_acc.get("candidate_prefilter_seconds", 0.0), "mean_raw_candidate_count": _mean([getattr(t, "raw_candidate_count", 0) for t in self.replay._data]), "mean_filtered_candidate_count": _mean([getattr(t, "filtered_candidate_count", 0) for t in self.replay._data]), "total_epoch_seconds": time.perf_counter() - ep_start}
             history.append(row)
             self._write_history(history)
             if row["validation_query_nll"] <= best:
@@ -370,7 +393,7 @@ class NCDMC3DQNTrainer:
             for t in range(min(self.selection_horizon, len(cand))):
                 mastery = torch.sigmoid(alpha).squeeze(0)
                 cov = self._coverage(hist_i)
-                item = self._select(hist_i, hist_r, cand, mastery, cov, t, epsilon=0.0)
+                item, _, _ = self._select(hist_i, hist_r, cand, mastery, cov, t, epsilon=0.0)
                 cand.remove(item)
                 hist_i.append(item)
                 hist_r.append(resp[item])
@@ -383,7 +406,7 @@ class NCDMC3DQNTrainer:
         return {"validation_query_nll": nll_score(ys, ps), "validation_query_auc": auc_score(ys, ps), "validation_query_brier": brier_score(ys, ps), "validation_mastery_entropy": _mean(ents), "validation_concept_coverage": _mean(covs)}
 
     def save_checkpoint(self, metrics: dict[str, float], epoch: int) -> None:
-        meta = build_checkpoint_metadata(knowledge_dim=self.cache.knowledge_dim, selection_horizon=self.selection_horizon, warm_start_items=1, alpha_fit=self.alpha_fit, reward_config=asdict(self.reward_cfg), model_config=self.model_config, candidate_pool_config={"max_candidates": None, "prefilter_enabled": False, "prefilter_top_k": 256, "prefilter_mode": "diagnostic_heuristic"}, ncdm_item_count=self.cache.ncdm_item_count, q_matrix_item_count=self.cache.q_matrix_item_count, training_seed=self.seed, validation_metrics=metrics, epoch=epoch, strict_item_count_check=self.cache.strict_item_count_check)
+        meta = build_checkpoint_metadata(knowledge_dim=self.cache.knowledge_dim, selection_horizon=self.selection_horizon, warm_start_items=1, alpha_fit=self.alpha_fit, reward_config=asdict(self.reward_cfg), model_config=self.model_config, candidate_pool_config=self.candidate_pool_config, ncdm_item_count=self.cache.ncdm_item_count, q_matrix_item_count=self.cache.q_matrix_item_count, training_seed=self.seed, validation_metrics=metrics, epoch=epoch, strict_item_count_check=self.cache.strict_item_count_check)
         torch.save({"model_state_dict": self.online_net.state_dict(), "metadata": meta}, self.out_dir / "best_checkpoint.pt")
 
     def _write_history(self, rows: list[dict[str, float]]) -> None:

@@ -1,0 +1,10 @@
+device: cpu
+benchmark:
+  track: ncdm_native
+  policies:
+    - Random-NCDM
+    - C3DQN-NCDM
+    - Set-C3DQN-NCDM
+  steps: [0, 1]
+  c3dqn_ncdm_checkpoint: outputs/ncdm_c3dqn/best_checkpoint.pt
+  set_c3dqn_ncdm_checkpoint: outputs/set_c3dqn_ncdm_smoke/best_checkpoint.pt
