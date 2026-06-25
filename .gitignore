@@ -7,6 +7,15 @@ checkpoints/
 outputs/
 wandb/
 *.ckpt
+.pytest_cache/
+.venv/
+venv/
+.env
+.DS_Store
+
+# Streamlit app local database
+data/app.db
+data/app.db-*
 
 # Conic10K downloaded raw data and generated audit artifacts
 /data/conic10k/
